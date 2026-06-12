@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# QA run artifacts
+runs/
+artifacts/
+screenshots/
+reports/
+*.trace.zip
+*.har
+*.webm
+*.mp4
+results.json
+audit-summary.json
+evidence-ledger.local.json
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
