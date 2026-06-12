@@ -1,8 +1,16 @@
-# 自动化 QA-Test Skill
+# 自动化 QA-Test
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Codex skill for strict, requirement-driven QA of web applications and APIs.
 
 This skill helps Codex turn a requirement, issue, PR, or bug report into a test matrix, execute browser/API probes, maintain an evidence ledger, audit the evidence, and generate a report without fabricating data.
+
+## Skill Name
+
+```text
+$automated-qa-test
+```
 
 ## What It Does
 
@@ -24,12 +32,32 @@ cp -R skills/automated-qa-test "${CODEX_HOME:-$HOME/.codex}/skills/"
 
 Restart Codex if the skill list does not refresh automatically.
 
+Or install from this repository with your preferred Codex skill installer if available:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/install-skill-from-github.py" \
+  --repo Hoshino-wind/automated-qa-test \
+  --path skills/automated-qa-test
+```
+
 ## Usage
 
 Ask Codex to use the skill with a requirement, issue, PR, or test scope:
 
 ```text
 Use $automated-qa-test to strictly test this requirement. Do not fabricate data. Every Passed item must have evidence.
+```
+
+Example requirement:
+
+```text
+Use $automated-qa-test to test this issue end to end.
+Requirements:
+- The user can submit the form.
+- The API returns 200.
+- The created record appears in the list.
+- Do not fabricate data.
+- Mark anything without direct evidence as Untested, Blocked, or Inconclusive.
 ```
 
 Typical workflow:
@@ -84,6 +112,16 @@ Allowed requirement statuses:
 - `Inconclusive`
 
 `Passed` requires direct current-run evidence. UI rendering alone does not prove data/API correctness when the requirement depends on data flow.
+
+The audit fails when:
+
+- a requirement has no mapped tests;
+- a matrix requirement or test is missing from the evidence ledger;
+- a `Passed` requirement has no evidence;
+- a `Passed` test has no evidence;
+- a requirement or test references missing evidence;
+- screenshot/file evidence points to a missing local file;
+- a non-passed item lacks explanatory notes.
 
 ## Privacy
 
