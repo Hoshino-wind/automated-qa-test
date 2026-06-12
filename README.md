@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+[中文文档](README.zh-CN.md)
+
 A Codex skill for strict, requirement-driven QA of web applications and APIs.
 
 This skill helps Codex turn a requirement, issue, PR, or bug report into a test matrix, execute browser/API probes, maintain an evidence ledger, audit the evidence, and generate a report without fabricating data.
