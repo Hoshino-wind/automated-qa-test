@@ -1,4 +1,4 @@
-# Requirement QA Charter Template
+# 自动化 QA-Test Charter Template
 
 Use this template to convert a requirement, issue, or PR into a testable plan.
 

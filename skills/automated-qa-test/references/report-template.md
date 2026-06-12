@@ -1,4 +1,4 @@
-# Requirement QA Report Template
+# 自动化 QA-Test Report Template
 
 # <Feature / Requirement Name> QA Report
 

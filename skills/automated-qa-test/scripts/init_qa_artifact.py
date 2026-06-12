@@ -99,7 +99,7 @@ def main() -> int:
     parser.add_argument("--requirement-file", help="Path to requirement, issue, or PR notes.")
     parser.add_argument("--requirement-text", help="Inline requirement text.")
     parser.add_argument("--base-url", default="http://127.0.0.1:3000")
-    parser.add_argument("--out-dir", default=str(Path(tempfile.gettempdir()) / "requirement-driven-qa"))
+    parser.add_argument("--out-dir", default=str(Path(tempfile.gettempdir()) / "automated-qa-test"))
     parser.add_argument("--slug", help="Readable run slug.")
     args = parser.parse_args()
 

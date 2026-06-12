@@ -1,4 +1,4 @@
-# Requirement Driven QA Skill
+# 自动化 QA-Test Skill
 
 A Codex skill for strict, requirement-driven QA of web applications and APIs.
 
@@ -19,7 +19,7 @@ Copy the skill folder into your Codex skills directory:
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/requirement-driven-qa "${CODEX_HOME:-$HOME/.codex}/skills/"
+cp -R skills/automated-qa-test "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
 Restart Codex if the skill list does not refresh automatically.
@@ -29,7 +29,7 @@ Restart Codex if the skill list does not refresh automatically.
 Ask Codex to use the skill with a requirement, issue, PR, or test scope:
 
 ```text
-Use $requirement-driven-qa to strictly test this requirement. Do not fabricate data. Every Passed item must have evidence.
+Use $automated-qa-test to strictly test this requirement. Do not fabricate data. Every Passed item must have evidence.
 ```
 
 Typical workflow:

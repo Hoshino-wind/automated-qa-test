@@ -1,7 +1,0 @@
-interface:
-  display_name: "Requirement Driven QA"
-  short_description: "需求驱动的功能交互与数据链路测试"
-  default_prompt: "Use $requirement-driven-qa to test this requirement end to end and produce an evidence-backed QA report."
-
-policy:
-  allow_implicit_invocation: true

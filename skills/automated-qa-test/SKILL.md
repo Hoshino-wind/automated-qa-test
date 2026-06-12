@@ -1,9 +1,9 @@
 ---
-name: requirement-driven-qa
-description: Strict requirement-driven QA workflow for testing web/app features from a user-written requirement, GitHub issue/PR, bug report, or acceptance criteria. Use when Codex needs to dynamically derive a test plan, verify feature logic, interaction behavior, data/API flow, console/network errors, screenshots, no-fabrication evidence integrity, completeness checks, and produce an evidence-backed test report. Triggers include 自动化测试, 测试需求, issue 测试, PR 测试, 功能逻辑测试, 交互测试, 数据是否通, 接口是否通, 错误检查, 严格测试, 不能有遗漏, 禁止编造数据, Playwright 测试报告.
+name: automated-qa-test
+description: Strict automated QA testing workflow for web/app features from a user-written requirement, GitHub issue/PR, bug report, or acceptance criteria. Use when Codex needs to dynamically derive a test plan, verify feature logic, interaction behavior, data/API flow, console/network errors, screenshots, no-fabrication evidence integrity, completeness checks, and produce an evidence-backed test report. Triggers include 自动化测试, 自动化qa-test, QA test, 测试需求, issue 测试, PR 测试, 功能逻辑测试, 交互测试, 数据是否通, 接口是否通, 错误检查, 严格测试, 不能有遗漏, 禁止编造数据, Playwright 测试报告.
 ---
 
-# Requirement-Driven QA
+# 自动化 QA-Test
 
 Use this skill as a dynamic QA harness. Do not hardcode product pages, route lists, business rules, or expected results inside the skill. Derive them each time from the current request, issue, PR, requirement text, repo behavior, and visible runtime evidence.
 

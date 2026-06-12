@@ -1,0 +1,7 @@
+interface:
+  display_name: "自动化 QA-Test"
+  short_description: "需求驱动的功能交互与数据链路测试"
+  default_prompt: "Use $automated-qa-test to test this requirement end to end and produce an evidence-backed QA report."
+
+policy:
+  allow_implicit_invocation: true

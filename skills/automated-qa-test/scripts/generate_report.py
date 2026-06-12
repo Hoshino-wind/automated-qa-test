@@ -61,7 +61,7 @@ def main() -> int:
     audit_summary = load_json(Path(args.audit_summary)) if args.audit_summary else None
 
     lines = []
-    lines.append("# Requirement-Driven QA Report")
+    lines.append("# 自动化 QA-Test Report")
     lines.append("")
     lines.append("## 1. Summary")
     lines.append("")

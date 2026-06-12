@@ -7,7 +7,7 @@
 ```json
 {
   "baseUrl": "http://127.0.0.1:3000",
-  "artifactDir": "/tmp/requirement-driven-qa/run",
+  "artifactDir": "/tmp/automated-qa-test/run",
   "scenarios": [
     {
       "id": "main-flow",
