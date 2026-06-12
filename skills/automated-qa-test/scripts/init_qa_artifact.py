@@ -126,7 +126,7 @@ def main() -> int:
         "## Coverage Gaps\n\n"
         "- Blocked:\n"
         "- Not safe to test:\n"
-        "- Needs user-provided credential/data:\n"
+        "- Needs user-provided access/data:\n"
         "- Deferred regression scope:\n"
         "- Requirement points without evidence:\n",
         encoding="utf-8",

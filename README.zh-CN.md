@@ -197,21 +197,6 @@ python3 scripts/generate_report.py \
 - 截图/文件证据路径不存在。
 - 非 Passed 状态没有说明原因。
 
-## 隐私和脱敏
-
-不要提交测试运行产物，尤其是：
-
-- 截图
-- 日志
-- 报告
-- cookie/session
-- token/API key
-- 客户数据
-- 私有 URL
-- 测试账号和密码
-
-仓库 `.gitignore` 已默认忽略常见测试产物，但提交前仍应检查。
-
 ## 许可证
 
 MIT

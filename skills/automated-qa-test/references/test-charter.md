@@ -44,6 +44,6 @@ Allowed statuses: Passed, Failed, Blocked, Untested, Inconclusive.
 
 - Blocked:
 - Not safe to test:
-- Needs user-provided credential/data:
+- Needs user-provided access/data:
 - Deferred regression scope:
 - Requirement points without evidence:

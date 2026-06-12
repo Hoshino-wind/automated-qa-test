@@ -45,7 +45,7 @@ When the user provides an issue, PR, URL, screenshot, or free-form requirement:
 - Gather the latest requirement text from the provided source. If the source is a GitHub issue/PR, inspect the description, comments that change scope, linked commits if relevant, and changed files when useful.
 - If the user writes the requirement directly, use that text as the source of truth.
 - If the current browser page is relevant, inspect the visible UI and network behavior before deciding the test surface.
-- Do not ask for clarification unless a destructive action, production mutation, or missing credential blocks meaningful testing.
+- Do not ask for clarification unless a destructive action, production mutation, or missing access blocks meaningful testing.
 
 Extract these fields into a working test charter:
 
@@ -173,7 +173,6 @@ Use `references/report-template.md` when formatting a final report.
 
 ## Safety Rules
 
-- Never log passwords, tokens, session cookies, API keys, or private credentials in reports.
 - Do not mutate production data unless the user explicitly authorizes that exact destination and action.
 - Prefer test data or clearly reversible actions for create/update/delete flows.
 - If testing requires sending personal data or inviting external users, confirm first.

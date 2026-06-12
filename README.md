@@ -125,10 +125,6 @@ The audit fails when:
 - screenshot/file evidence points to a missing local file;
 - a non-passed item lacks explanatory notes.
 
-## Privacy
-
-Do not commit run artifacts that contain screenshots, logs, reports, credentials, tokens, session data, customer data, or private URLs. The repository `.gitignore` excludes common generated QA artifacts by default.
-
 ## License
 
 MIT
