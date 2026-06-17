@@ -7,6 +7,7 @@ Use this template to convert a requirement, issue, or PR into a testable plan.
 - Requirement source:
 - Branch/PR/issue:
 - Target environment:
+- Data boundary: local/test/staging/prod; mock/seed/real data:
 - Test account/role:
 - Out-of-scope areas:
 
@@ -14,7 +15,7 @@ Use this template to convert a requirement, issue, or PR into a testable plan.
 
 | ID | Requirement Point | Source Evidence | Test Mapping | Status |
 | --- | --- | --- | --- | --- |
-| R1 |  | Quote/link exact source line | T1 | Pending |
+| R1 |  | Quote/link exact source line | T1 | Untested |
 
 Do not leave a requirement point unmapped. If it is out of scope, blocked, or unsafe to test, state that explicitly in `Test Mapping`.
 
@@ -28,7 +29,10 @@ Do not leave a requirement point unmapped. If it is out of scope, blocked, or un
 | State transitions |  |
 | Input validation |  |
 | API/data dependencies |  |
+| Stream/WebSocket/SSE dependencies |  |
 | Persistence/display rules |  |
+| Strong pass signals |  |
+| Weak/misleading signals |  |
 | Error and empty states |  |
 | Responsive/interaction risks |  |
 
@@ -36,14 +40,24 @@ Do not leave a requirement point unmapped. If it is out of scope, blocked, or un
 
 | ID | Requirement | Test Type | Steps/Probe | Expected Result | Required Evidence | Actual Evidence | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| T1 | R1 | logic |  |  | screenshot/log/API |  | Pending |
+| T1 | R1 | logic |  |  | screenshot/log/API |  | Untested |
 
 Allowed statuses: Passed, Failed, Blocked, Untested, Inconclusive.
+
+## Evidence Layer Plan
+
+Use this table when one workflow crosses multiple layers.
+
+| Requirement | Layer | Strong Evidence Needed | Weak Evidence To Avoid | Probe |
+| --- | --- | --- | --- | --- |
+| R1 | UI |  |  | Playwright screenshot/assertion |
+| R1 | API/stream |  |  | API/WebSocket/SSE probe |
+| R1 | Persistence/log |  |  | Read-only command/helper |
 
 ## Coverage Gaps
 
 - Blocked:
 - Not safe to test:
-- Needs user-provided access/data:
+- Needs user-provided credential/data:
 - Deferred regression scope:
 - Requirement points without evidence:
