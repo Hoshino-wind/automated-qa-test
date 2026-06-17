@@ -360,6 +360,8 @@ A good final report includes:
 
 Every report must include a `Coverage Gaps` section, even when it says `None identified in the tested scope`. This prevents silent omission.
 
+For Feishu/Lark QA or backtest report deliverables, create a new document for every run. Do not append a new backtest to a prior report, a remembered document URL, or a thematically related historical document. Treat historical Feishu URLs as reference context only, not as write targets. After creating the new document, report its URL and verify by fetching the new document content or revision and checking the run title plus key verdict text. Only override this new-document rule when the current user message explicitly names an existing document URL and explicitly says to append or update that exact document despite the per-run new-document default.
+
 If the user asks for a Feishu/Word/Google Docs report with screenshots, embed images in the document artifact before uploading/importing. Do not rely on local image paths inside the report text.
 
 Use `references/report-template.md` when formatting a final report.
