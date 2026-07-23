@@ -1,202 +1,135 @@
 # 自动化 QA-Test
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[English](README.md) · [MIT 许可证](LICENSE)
 
-这是一个面向 Codex 的自动化测试 Skill，用于对 Web 应用和 API 做严格的、需求驱动的 QA 测试。
+这是一个面向 Codex 的、由需求驱动且证据绑定的 QA Skill。它把需求编译成 UI、API、WebSocket/SSE、持久化、日志或命令探针；所有 `Passed` 都必须绑定本次运行证据，最终由默认失败关闭的 `qa-verdict.json` 决定能否声称通过。
 
-它的核心目标是：让 Codex 从需求、Issue、PR 或 Bug 描述中提取测试点，生成测试矩阵，执行浏览器/API 探测，维护证据账本，并在生成报告前做证据审计，避免编造数据或把未测试内容写成通过。
+## 运行要求
 
-## Skill 名称
+- Python 3.12+
+- Node.js 20+
+- npm
+- 浏览器探针需要 Chrome 或 Playwright 管理的 Chromium
 
-```text
-$automated-qa-test
+先安装仓库自有依赖：
+
+```bash
+npm ci
 ```
 
-## 适合什么场景
+runner 不再从个人 Codex Skill 目录借用 Playwright；本地与 CI 都以 `package-lock.json` 为唯一可复现依赖来源。
 
-- 根据一段需求描述做功能测试。
-- 根据 GitHub Issue 或 PR 做验收测试。
-- 检查功能逻辑是否通。
-- 检查交互是否正常，例如按钮、弹窗、表单校验、加载态、错误提示。
-- 检查接口/API 是否正常返回。
-- 检查数据是否从输入、接口、持久化到页面展示形成闭环。
-- 捕获 console error、network 4xx/5xx、截图和报告证据。
-- 生成严格区分 `Passed / Failed / Blocked / Untested / Inconclusive` 的测试报告。
-
-## 设计原则
-
-这个 Skill 不会固化某个项目的页面、路由、接口或业务规则。
-
-每次测试时，Codex 应该从本次输入中动态推导测试范围：
-
-- 用户直接写的需求
-- GitHub Issue
-- GitHub PR
-- Bug 描述
-- 验收标准
-- 当前代码和运行时行为
-
-重点是：**没有证据，不能判定通过。**
-
-## 安装
-
-把 Skill 目录复制到 Codex 的 skills 目录：
+## 安装 Skill
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/automated-qa-test "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
-如果 Codex 没有自动刷新 Skill 列表，重启 Codex。
+使用时以 `$automated-qa-test` 提供需求、Issue、PR 或 Bug 描述。
 
-也可以通过 Codex 的 skill installer 安装：
+## 唯一推荐流程
 
-```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/install-skill-from-github.py" \
-  --repo Hoshino-wind/automated-qa-test \
-  --path skills/automated-qa-test
-```
-
-## 使用方式
-
-对 Codex 说：
-
-```text
-Use $automated-qa-test to strictly test this requirement. Do not fabricate data. Every Passed item must have evidence.
-```
-
-中文也可以这样说：
-
-```text
-使用 $automated-qa-test 严格测试下面这个需求。
-要求：
-- 不能遗漏需求点
-- 禁止编造数据
-- 每个 Passed 必须有当前运行证据
-- 没测到的写 Untested
-- 测不了的写 Blocked
-- 证据不足的写 Inconclusive
-```
-
-示例需求：
-
-```text
-使用 $automated-qa-test 测试这个 Issue：
-- 用户可以提交表单
-- 接口返回 200
-- 创建的数据会出现在列表中
-- 表单校验和错误提示正常
-- 不允许编造数据
-```
-
-## 标准工作流
-
-1. 创建本次测试运行目录。
-2. 读取需求、Issue 或 PR。
-3. 提取需求点，生成 `test-matrix.json`。
-4. 生成或修改 `test-plan.json`。
-5. 用 Playwright runner 执行浏览器/API 探测。
-6. 根据当前运行的截图、接口、日志、网络请求填写 `evidence-ledger.json`。
-7. 运行 `audit_evidence.py` 做证据审计。
-8. 生成 Markdown 测试报告。
-
-## 运行产物
-
-一次测试运行通常包含：
-
-```text
-<run-dir>/
-├── requirement.md
-├── test-charter.md
-├── test-matrix.json
-├── test-plan.json
-├── results.json
-├── evidence-ledger.json
-├── audit-summary.json
-├── screenshots/
-└── report.md
-```
-
-## 常用脚本
-
-进入 Skill 目录：
+先显式声明环境与数据边界并初始化：
 
 ```bash
-cd skills/automated-qa-test
+python3 skills/automated-qa-test/scripts/init_qa_artifact.py \
+  --requirement-file /path/to/requirement.md \
+  --base-url http://127.0.0.1:3000 \
+  --runtime-mode test \
+  --data-boundary-status "隔离测试库；不含生产数据"
 ```
 
-初始化测试运行目录：
+人工复核生成的 matrix 与 plan 后，运行完整闭环：
 
 ```bash
-python3 scripts/init_qa_artifact.py \
-  --requirement-text "用户可以提交表单，并在列表中看到保存后的数据。" \
-  --base-url http://127.0.0.1:3000
+python3 skills/automated-qa-test/scripts/run_qa_cycle.py \
+  --run-dir /path/to/run \
+  --preflight-runtime \
+  --strict-runtime
 ```
 
-执行 Playwright 探测：
+`run_qa_cycle.py` 是正常执行入口。它会刷新语义产物、检查需求覆盖、验证并以 SHA-256 绑定计划、执行探针、生成并审计证据账本、派生缺陷与下一探针、写入严格 verdict，最后生成报告。
 
-```bash
-node scripts/playwright_probe.mjs --plan /path/to/run/test-plan.json
+含 `command` 的计划必须把 `playwright_probe.mjs` 绑定到通过的 `plan-audit-summary.json`，且摘要中的计划路径和哈希必须与当前文件完全一致。shell 字符串和 `shell: true` 默认拒绝，应使用关闭 shell 执行的数组命令；`--allow-unsafe-command` 只能放宽普通 shell 边界，不能放行秘密文件读取、导出、上传、写入或其他秘密变更。所有输出默认必须位于 `--run-dir` 内；若输出目标是目录，系统会保留目录并阻断，不会递归删除。
+
+## 默认失败关闭门
+
+默认只有同时满足以下条件，`can_claim_pass` 才可能为 `true`：
+
+- plan、matrix、results、ledger 的主版本均为 2；
+- requirement source 已完整映射；
+- plan audit 通过且绑定当前计划哈希；
+- `results.json` 经证据审计绑定到当前 ledger；
+- 没有未解释的运行时、服务、Adapter、缺陷或流水线问题；
+- `adapter-context.json` 已确认运行环境与数据边界。
+
+`--allow-unconfirmed-environment`、`--allow-unvalidated-plan`、`--allow-missing-requirement-coverage` 只用于显式的规划或不完整运行，不能把这类输出描述成真实环境通过。
+
+如果自定义探针没有 `results.json`，审计与终局都必须绑定 provenance manifest：
+
+```json
+{
+  "schema_version": 1,
+  "mode": "manual",
+  "operator": "qa-user",
+  "observed_at": "2026-07-22T12:00:00+08:00",
+  "statement": "证据来自已声明的隔离测试环境。",
+  "evidence_ids": ["E1", "E2"]
+}
 ```
 
-运行证据审计：
-
 ```bash
-python3 scripts/audit_evidence.py \
+python3 skills/automated-qa-test/scripts/audit_evidence.py \
   --matrix /path/to/run/test-matrix.json \
   --ledger /path/to/run/evidence-ledger.json \
+  --manual-evidence-manifest /path/to/run/manual-evidence-manifest.json \
   --summary /path/to/run/audit-summary.json
 ```
 
-生成报告：
+手工模式是显式、可审计且带哈希绑定的；只手写 `current_run`、`assertions` 或 `proves` 不再能得到最终通过。
+
+## 项目 Adapter
+
+通用内核不保存具体项目路径。可选项目知识放在 `skills/automated-qa-test/references/adapters/*.json`：marker、服务、端口、env/config 候选、证据层、预检路由和探针默认值都由 Adapter 配置拥有。通用脚本只读取 registry 协议。
+
+## 架构边界
+
+`scripts/*.py` 保持稳定的命令行兼容入口；`scripts/qa_core/contracts` 集中拥有产物路径、JSON Schema 运行时校验、证据字段和 runner 绑定规则，`scripts/qa_core/pipeline` 集中拥有 `CycleOptions`、`CycleContext` 与统一的阶段执行/记账边界。`CycleRuntime` 依次组合需求覆盖、预检、Adapter、计划、探针、证据和结论阶段。审计、verdict、报告和周期编排共享这些契约，不再各自维护一份近似实现。
+
+脚手架内部遵循 `qa_scaffold/support → intents → modeling → rules → entry` 单向依赖，原 `scaffold_requirement.py` 继续提供既有 Python 导入和 CLI；需求分类被拆为信号采集、冲突消歧和 3 个标签投影族，需求专属证据映射以及基础、韧性、认证、完整性、高级、UI 交互和运行时规则均由原公开入口调度有界的私有领域助手。回归侧将代码 PR、需求源覆盖和 Agent 路由协议分别放入仅依赖 support 的专属模块，再由 `contracts` 或 `agent` 兼容导出稳定夹具入口；构建发布与秘密安全夹具继续拆为私有子场景注册表，同时保持 7 族公开夹具契约不变。`regression_check.py` 只负责夹具注册、完整阶段编排和 CLI；架构测试持续约束依赖方向、有界私有场景注册表与兼容导出。
+
+CI 会在编译和测试前执行 Ruff `E`、`F`、`I` 门禁。需求与夹具中的长篇原文明确不受 `E501` 数值限制，测试启动器允许在显式设置本地 `sys.path` 后导入；未使用导入、死局部变量和导入顺序仍会阻断 CI。
+
+## 运行产物与状态
+
+完整运行会产出需求、业务/Oracle 模型、charter、matrix、plan、环境上下文、预检/服务记录、需求与计划审计、results、ledger、audit、defects、next probes、verdict、Agent handoff 和报告。业务模型、Oracle、指标都标记为 `not_evidence=true`，不能替代当前运行证据。
+
+合法状态只有 `Passed`、`Failed`、`Blocked`、`Untested`、`Inconclusive`。
+
+## 维护验证
+
+快速安全与语法检查：
 
 ```bash
-python3 scripts/generate_report.py \
-  --plan /path/to/run/test-plan.json \
-  --results /path/to/run/results.json \
-  --requirement /path/to/run/requirement.md \
-  --ledger /path/to/run/evidence-ledger.json \
-  --audit-summary /path/to/run/audit-summary.json \
-  --out /path/to/run/report.md
+npm test
+python3 -m compileall -q skills/automated-qa-test/scripts
 ```
 
-## 状态定义
+`npm test` 还会运行 `references/modeling-adversarial-cases.json` 中独立于内置 gold corpus 的上下文对抗语料，覆盖静态安全术语、422 表单校验体验、撤销业务不变量和浏览器滚动状态恢复。
 
-需求点只能使用以下状态：
+完整维护回归：
 
-- `Passed`：已用当前运行证据直接证明。
-- `Failed`：已测试，并且证据证明不符合预期。
-- `Blocked`：因为明确阻塞原因无法测试。
-- `Untested`：本次没有测到。
-- `Inconclusive`：有证据，但证据不足或互相矛盾，无法判定通过或失败。
+```bash
+npm run test:regression
+python3 skills/automated-qa-test/scripts/regression_check.py --with-browser
+```
 
-## 证据规则
+开发中可以列出并定向执行隔离回归组；不传 `--group` 时仍执行原有完整非浏览器回归：
 
-`Passed` 必须有直接证据。证据可以是：
+```bash
+python3 skills/automated-qa-test/scripts/regression_check.py --list-groups
+python3 skills/automated-qa-test/scripts/regression_check.py --group contracts --group evidence
+```
 
-- 截图
-- API 响应
-- HTTP 状态码
-- 返回字段
-- 后端日志
-- console/network 记录
-- 页面可见文本
-- 数据库或持久化检查结果
-
-如果需求涉及数据链路，不能只因为 UI 看起来正常就判定通过。需要进一步验证 API、返回数据、持久化或日志。
-
-## 审计失败条件
-
-`audit_evidence.py` 会在以下情况失败：
-
-- 需求点没有映射测试项。
-- 测试矩阵里的需求或测试没有出现在证据账本里。
-- `Passed` 的需求没有证据。
-- `Passed` 的测试没有证据。
-- 需求或测试引用了不存在的证据。
-- 截图/文件证据路径不存在。
-- 非 Passed 状态没有说明原因。
-
-## 许可证
-
-MIT
+CI 会执行依赖安装、Python 编译、安全套件、Node 语法检查和完整的非浏览器回归。

@@ -1,0 +1,22 @@
+{
+  "name": "automated-qa-test-skill",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Evidence-bound automated QA/backtest skill helpers",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check:node": "node --check skills/automated-qa-test/scripts/playwright_probe.mjs",
+    "test:security": "python3 -m unittest discover -s skills/automated-qa-test/scripts/tests -v",
+    "test:modeling-adversarial": "python3 skills/automated-qa-test/scripts/modeling_benchmark.py --adversarial-cases skills/automated-qa-test/references/modeling-adversarial-cases.json --only-adversarial --work-dir artifacts/modeling-adversarial --out artifacts/modeling-adversarial.json --target-percent 95 --fail-on-below-target",
+    "test:regression:contracts": "python3 skills/automated-qa-test/scripts/regression_check.py --group contracts",
+    "test:regression:evidence": "python3 skills/automated-qa-test/scripts/regression_check.py --group evidence",
+    "test:regression": "python3 skills/automated-qa-test/scripts/regression_check.py",
+    "test": "npm run check:node && npm run test:security && npm run test:modeling-adversarial"
+  },
+  "dependencies": {
+    "playwright": "1.60.0"
+  }
+}

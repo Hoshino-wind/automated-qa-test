@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json
 
 SAFE_REQUIRED_INPUTS = {
     "current-run execution evidence",
@@ -42,8 +43,7 @@ def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def file_sha256(path: Path) -> str | None:

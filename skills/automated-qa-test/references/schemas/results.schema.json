@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openai.local/automated-qa-test/results.schema.json",
+  "title": "Automated QA Probe Results v2",
+  "type": "object",
+  "required": ["schemaVersion", "artifactDir", "scenarios", "console", "failedResponses", "requestFailures"],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "artifactDir": { "type": "string", "minLength": 1 },
+    "scenarios": { "type": "array" },
+    "console": { "type": "array" },
+    "failedResponses": { "type": "array" },
+    "requestFailures": { "type": "array" }
+  }
+}

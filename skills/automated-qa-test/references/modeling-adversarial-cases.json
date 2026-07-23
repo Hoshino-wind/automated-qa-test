@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "description": "Independent adversarial regression corpus for context-sensitive requirement modeling. These cases are not part of the in-file gold corpus.",
+  "cases": [
+    {
+      "id": "static_security_glossary_cn",
+      "title": "Static glossary must not imply API, persistence, or permission behavior",
+      "base_url": "http://127.0.0.1:9527",
+      "entry_path": "/help/glossary",
+      "requirement": "# 安全术语表\n\n/help/glossary 是纯静态只读页面，展示 API token、session cookie、登录态和数据库持久化等术语的文字解释。不调用接口、不发送网络请求、无需登录或鉴权，也不写入数据库。页面内容必须可见。\n",
+      "expected": {
+        "test_types": [["ui"]],
+        "evidence_layers": [["ui"]],
+        "forbidden_test_types": [["api"], ["persistence"], ["permission"], ["api_key"], ["session_security"]],
+        "forbidden_evidence_layers": [["api_key_secret_once"], ["session_cookie"], ["authorization_policy"]]
+      }
+    },
+    {
+      "id": "validation_422_ux_cn",
+      "title": "422 validation UX must retain input and avoid persistence classification",
+      "base_url": "http://127.0.0.1:9527",
+      "entry_path": "/profile",
+      "requirement": "# 资料表单校验\n\n用户在 /profile 编辑 name 字段并点击保存，PATCH /api/v1/profile 返回 422 参数错误时，必须保留输入值，在 name 字段下方显示字段错误，不显示成功 toast；用户修改该字段后错误提示立即消失。\n",
+      "expected": {
+        "api_paths": [["/api/v1/profile"]],
+        "test_types": [["ui"], ["interaction"], ["api"]],
+        "evidence_layers": [["api_response"], ["validation_error"], ["field_error"], ["input_value_preserved"], ["no_success_toast"], ["error_clear_on_edit"]],
+        "forbidden_test_types": [["persistence"], ["permission"]]
+      }
+    },
+    {
+      "id": "coupon_revocation_invariants_cn",
+      "title": "Coupon revocation must cover budget, link status, and concurrency invariants",
+      "base_url": "http://127.0.0.1:9527",
+      "entry_path": "/campaigns/campaign_qa_1",
+      "requirement": "# 优惠券活动撤销\n\n管理员在 /campaigns/campaign_qa_1 撤销优惠券活动；POST /api/v1/coupons/coupon_qa_1/revoke 后状态从 active 变为 revoked，释放并返还 budget_remaining，关联 promotion_link.status 变为 inactive。两个并发撤销只能成功一次，另一请求返回 409；不得重复返还额度或生成重复记录。\n",
+      "expected": {
+        "api_paths": [["/api/v1/coupons/coupon_qa_1/revoke"]],
+        "state_transitions": [["active", "revoked"]],
+        "test_types": [["api"], ["persistence"], ["concurrency"]],
+        "evidence_layers": [["business_revocation"], ["state_transition"], ["budget_balance"], ["link_status"], ["concurrent_requests"], ["atomicity"], ["conflict_response"], ["duplicate_absence"]]
+      }
+    },
+    {
+      "id": "scroll_restore_browser_state_cn",
+      "title": "Scroll restoration after refresh is browser state, not backend persistence",
+      "base_url": "http://127.0.0.1:9527",
+      "entry_path": "/feed",
+      "requirement": "# 信息流滚动位置\n\n用户在 /feed 向下滚动到 item-120。浏览器刷新后必须恢复到相同滚动位置；这是前端页面状态，不调用保存接口、不写数据库，也不要求登录。\n",
+      "expected": {
+        "test_types": [["ui"], ["interaction"]],
+        "evidence_layers": [["browser_state"], ["scroll_position"], ["reload"]],
+        "forbidden_test_types": [["api"], ["persistence"], ["permission"], ["cache_consistency"]]
+      }
+    }
+  ]
+}

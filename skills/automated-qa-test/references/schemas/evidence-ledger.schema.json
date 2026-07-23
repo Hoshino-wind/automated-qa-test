@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openai.local/automated-qa-test/evidence-ledger.schema.json",
+  "title": "Automated QA Evidence Ledger v2",
+  "type": "object",
+  "required": ["schema_version", "requirements", "tests", "evidence"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "requirements": { "type": "array", "items": { "type": "object", "required": ["id", "status", "test_ids", "evidence_ids"] } },
+    "tests": { "type": "array", "items": { "type": "object", "required": ["id", "status", "requirement_ids", "evidence_ids"] } },
+    "evidence": { "type": "array", "items": { "type": "object", "required": ["id", "type", "proves"] } }
+  }
+}

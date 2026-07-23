@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import shlex
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from adapter_registry import get_adapter_definition
 from discover_project_context import discover_context, service_status
+from qa_common import atomic_write_json
 
-
-OPC_ENV_CANDIDATES = {
-    "one_corpus_web": ["one_corpus_web/.env.local", "one_corpus_web/.env.localdesktop", "one_corpus_web/.env.example"],
-    "opc-bot": ["opc-bot/configs/config.yaml"],
-    "agent_platform": ["agent_platform/.env", "agent_platform/.env.example"],
-    "ops_web": ["ops_web/.env.local", "ops_web/.env.example"],
+ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PACKAGE_CROSS_ENV_EXEC_SUBCOMMANDS = {"exec", "dlx", "x"}
+PACKAGE_MANAGER_EXECUTABLES = {"npm", "pnpm", "yarn"}
+PACKAGE_RUNNER_OPTIONS_WITH_VALUE = {
+    "--cache", "--call", "-c", "--cwd", "-C", "--dir", "--filter", "-F",
+    "--package", "-p", "--registry", "--userconfig",
 }
-OPC_REQUIRED_FOR_BASE_URL = {
-    "9527": {"one_corpus_web", "opc-bot"},
-    "8081": {"opc-bot"},
-    "8000": {"agent_platform"},
-    "3070": {"ops_web"},
-}
-
+NPM_OPTIONS_WITH_VALUE = {"--prefix", "--workspace", "-w", "--userconfig", "--cache"}
+PACKAGE_DIR_OPTIONS = {"--prefix", "--dir", "-C", "--cwd"}
 
 def load_json(path: Path) -> dict[str, Any]:
     value, load_error = try_load_json(path)
@@ -49,8 +48,7 @@ def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def as_list(value: Any) -> list[Any]:
@@ -68,11 +66,127 @@ def rel(path: Path, root: Path) -> str:
         return str(path)
 
 
-def command_parts(command: str) -> list[str]:
+def command_parts(command: Any) -> list[str]:
+    if isinstance(command, list):
+        return [str(part) for part in command]
     try:
-        return shlex.split(command)
+        return shlex.split(str(command or ""))
     except ValueError:
-        return command.split()
+        return str(command or "").split()
+
+
+def strip_leading_env_assignments(parts: list[str]) -> list[str]:
+    index = 0
+    while index < len(parts) and ENV_ASSIGNMENT_RE.match(parts[index]):
+        index += 1
+    if index < len(parts) - 1 and Path(parts[index]).name.lower() == "env":
+        nested_index = env_wrapper_nested_command_index(parts, index)
+        if nested_index is not None:
+            return parts[nested_index:]
+    return parts[index:]
+
+
+def skip_package_runner_options(parts: list[str], index: int) -> int:
+    while index < len(parts):
+        part = str(parts[index])
+        if part == "--":
+            return index + 1
+        if not part.startswith("-"):
+            break
+        option = part.split("=", 1)[0]
+        index += 1
+        if "=" not in part and option in PACKAGE_RUNNER_OPTIONS_WITH_VALUE and index < len(parts):
+            index += 1
+    return index
+
+
+def package_runner_cross_env_index(parts: list[str], start_index: int = 0) -> int | None:
+    if start_index >= len(parts):
+        return None
+    starter = Path(parts[start_index]).name.lower()
+    if starter == "cross-env":
+        return start_index
+    if starter == "corepack" and start_index + 1 < len(parts):
+        return package_runner_cross_env_index(parts, start_index + 1)
+    if starter == "npx":
+        index = skip_package_runner_options(parts, start_index + 1)
+        if index < len(parts) and Path(parts[index]).name.lower() == "cross-env":
+            return index
+        return None
+    if starter not in {"npm", "pnpm", "yarn"}:
+        return None
+    index = skip_package_runner_options(parts, start_index + 1)
+    if index >= len(parts) or parts[index] not in PACKAGE_CROSS_ENV_EXEC_SUBCOMMANDS:
+        return None
+    index = skip_package_runner_options(parts, index + 1)
+    if index < len(parts) and Path(parts[index]).name.lower() == "cross-env":
+        return index
+    return None
+
+
+def env_wrapper_nested_command_index(parts: list[str], env_index: int = 0) -> int | None:
+    if env_index >= len(parts) or Path(parts[env_index]).name.lower() != "env":
+        return None
+    index = env_index + 1
+    while index < len(parts):
+        part = str(parts[index])
+        if part == "--":
+            index += 1
+            break
+        if ENV_ASSIGNMENT_RE.match(part):
+            index += 1
+            continue
+        if part in {"-i", "--ignore-environment"}:
+            index += 1
+            continue
+        if part == "-u":
+            if index + 1 >= len(parts) or not ENV_NAME_RE.match(str(parts[index + 1])):
+                return None
+            index += 2
+            continue
+        if part.startswith("--unset="):
+            if not ENV_NAME_RE.match(part.split("=", 1)[1]):
+                return None
+            index += 1
+            continue
+        break
+    if index >= len(parts):
+        return None
+    return index
+
+
+def strip_cross_env_assignments(parts: list[str]) -> list[str]:
+    cross_env_start = package_runner_cross_env_index(parts)
+    if cross_env_start is None:
+        return parts
+    index = cross_env_start + 1
+    while index < len(parts) and ENV_ASSIGNMENT_RE.match(parts[index]):
+        index += 1
+    if index < len(parts) and parts[index] == "--":
+        index += 1
+    return parts[index:]
+
+
+def strip_corepack_runner(parts: list[str]) -> list[str]:
+    if len(parts) >= 2 and Path(parts[0]).name.lower() == "corepack" and Path(parts[1]).name.lower() in PACKAGE_MANAGER_EXECUTABLES:
+        return parts[1:]
+    return parts
+
+
+def normalize_command_wrappers(parts: list[str]) -> list[str]:
+    parts = strip_leading_env_assignments(parts)
+    parts = strip_cross_env_assignments(parts)
+    return strip_corepack_runner(parts)
+
+
+def command_executable_parts(parts: list[str]) -> list[str]:
+    parts = strip_leading_env_assignments(parts)
+    if not parts:
+        return parts
+    starter = Path(parts[0]).name.lower()
+    if starter in {"corepack", "npx"} or starter in PACKAGE_MANAGER_EXECUTABLES:
+        return parts
+    return strip_cross_env_assignments(parts)
 
 
 def package_scripts(service_dir: Path) -> dict[str, str]:
@@ -87,7 +201,75 @@ def package_scripts(service_dir: Path) -> dict[str, str]:
     return scripts if isinstance(scripts, dict) else {}
 
 
+def resolve_command_dir(path_value: str, service_dir: Path) -> Path:
+    path = Path(str(path_value)).expanduser()
+    if path.is_absolute():
+        return path.resolve(strict=False)
+    return (service_dir / path).resolve(strict=False)
+
+
+def option_value(part: str, parts: list[str], index: int) -> tuple[str, str | None, int]:
+    if "=" in part and part.startswith("-"):
+        name, value = part.split("=", 1)
+        return name, value, 1
+    if index + 1 < len(parts):
+        return part, str(parts[index + 1]), 2
+    return part, None, 1
+
+
+def command_package_dir(parts: list[str], service_dir: Path, project_root: Path) -> Path:
+    parts = normalize_command_wrappers(parts)
+    if not parts:
+        return service_dir
+    executable = Path(parts[0]).name.lower()
+    package_dir = service_dir
+    if executable == "npm":
+        index = 1
+        while index < len(parts):
+            part = str(parts[index])
+            if part == "--":
+                break
+            option_name = part.split("=", 1)[0]
+            if option_name in PACKAGE_DIR_OPTIONS:
+                _, value, consumed = option_value(part, parts, index)
+                if value:
+                    package_dir = resolve_command_dir(value, service_dir)
+                index += consumed
+                continue
+            if part.startswith("-"):
+                if option_name in NPM_OPTIONS_WITH_VALUE and "=" not in part and index + 1 < len(parts):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            break
+        return package_dir
+    if executable in {"pnpm", "yarn"}:
+        index = 1
+        while index < len(parts):
+            part = str(parts[index])
+            if part == "--":
+                break
+            option_name = part.split("=", 1)[0]
+            if option_name in PACKAGE_DIR_OPTIONS:
+                _, value, consumed = option_value(part, parts, index)
+                if value:
+                    package_dir = resolve_command_dir(value, service_dir)
+                index += consumed
+                continue
+            if part.startswith("-"):
+                if option_name in PACKAGE_RUNNER_OPTIONS_WITH_VALUE and "=" not in part and index + 1 < len(parts):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            break
+        return package_dir
+    return package_dir
+
+
 def command_status(parts: list[str]) -> dict[str, Any]:
+    parts = command_executable_parts(parts)
     executable = parts[0] if parts else ""
     status: dict[str, Any] = {
         "executable": executable,
@@ -100,16 +282,331 @@ def command_status(parts: list[str]) -> dict[str, Any]:
     return status
 
 
-def npm_script_status(parts: list[str], service_dir: Path) -> dict[str, Any] | None:
-    if len(parts) < 3 or parts[0] != "npm" or parts[1] != "run":
+def nested_cross_env_command_parts(parts: list[str]) -> list[str]:
+    stripped = strip_leading_env_assignments(parts)
+    nested = strip_cross_env_assignments(stripped)
+    if not nested or nested == stripped:
+        return []
+    primary = command_executable_parts(parts)
+    if primary and Path(primary[0]).name.lower() == Path(nested[0]).name.lower():
+        return []
+    return nested
+
+
+def nested_command_status(parts: list[str], service_dir: Path, project_root: Path) -> dict[str, Any] | None:
+    nested = nested_cross_env_command_parts(parts)
+    if not nested:
         return None
-    script = parts[2]
-    scripts = package_scripts(service_dir)
+    status = command_status(nested)
+    if status["found"] or status.get("substitute"):
+        return status
+    executable = str(status.get("executable") or "")
+    if not executable or "/" in executable or "\\" in executable:
+        return status
+    for base_dir in (service_dir, project_root):
+        candidate = base_dir / "node_modules" / ".bin" / executable
+        if candidate.exists() and candidate.is_file():
+            status["found"] = True
+            status["path"] = str(candidate)
+            status["source"] = "node_modules_bin"
+            return status
+    return status
+
+
+def npm_script_status(parts: list[str], service_dir: Path, project_root: Path | None = None) -> dict[str, Any] | None:
+    root = project_root or service_dir
+    parts = normalize_command_wrappers(parts)
+    if not parts:
+        return None
+    executable = Path(parts[0]).name.lower()
+    script: str | None = None
+    package_dir = command_package_dir(parts, service_dir, root)
+    if executable == "npm":
+        index = 1
+        while index < len(parts):
+            part = str(parts[index])
+            if part == "--":
+                index += 1
+                break
+            option_name = part.split("=", 1)[0]
+            if option_name in PACKAGE_DIR_OPTIONS:
+                _, _, consumed = option_value(part, parts, index)
+                index += consumed
+                continue
+            if part.startswith("-"):
+                if option_name in NPM_OPTIONS_WITH_VALUE and "=" not in part and index + 1 < len(parts):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            break
+        if index < len(parts):
+            if parts[index] == "run" and index + 1 < len(parts):
+                script = parts[index + 1]
+            elif parts[index] in {"test", "start", "lint"}:
+                script = parts[index]
+    elif executable in {"pnpm", "yarn"}:
+        index = 1
+        while index < len(parts):
+            part = str(parts[index])
+            if part == "--":
+                index += 1
+                break
+            option_name = part.split("=", 1)[0]
+            if part.startswith("-"):
+                if option_name in PACKAGE_RUNNER_OPTIONS_WITH_VALUE and "=" not in part and index + 1 < len(parts):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            break
+        if index < len(parts):
+            if parts[index] == "run" and index + 1 < len(parts):
+                script = parts[index + 1]
+            elif parts[index] not in {"exec", "dlx", "x", "add", "install", "i", "remove", "rm"}:
+                script = str(parts[index])
+    if not script:
+        return None
+    scripts = package_scripts(package_dir)
     return {
         "script": script,
         "found": script in scripts,
         "available_scripts": sorted(scripts),
+        "package_dir": rel(package_dir, root),
     }
+
+
+def node_dependency_status(parts: list[str], service_dir: Path, project_root: Path) -> dict[str, Any] | None:
+    parts = normalize_command_wrappers(parts)
+    if not parts or Path(parts[0]).name.lower() not in PACKAGE_MANAGER_EXECUTABLES:
+        return None
+    package_dir = command_package_dir(parts, service_dir, project_root)
+    candidates: list[Path] = []
+    for candidate_dir in (package_dir, service_dir, project_root):
+        candidate = candidate_dir / "node_modules"
+        if not any(existing.resolve(strict=False) == candidate.resolve(strict=False) for existing in candidates):
+            candidates.append(candidate)
+    existing = [rel(path, project_root) for path in candidates if path.exists() and path.is_dir()]
+    return {
+        "required": True,
+        "found": bool(existing),
+        "candidates": [rel(path, project_root) for path in candidates],
+        "existing": existing,
+    }
+
+
+def iter_plan_required_path_specs(plan: dict[str, Any] | None):
+    if not isinstance(plan, dict):
+        return
+    containers = [("plan", plan)]
+    preflight = plan.get("preflight")
+    if isinstance(preflight, dict):
+        containers.append(("plan.preflight", preflight))
+    for prefix, container in containers:
+        for field, expected_kind in (
+            ("requiredFiles", "file"),
+            ("required_files", "file"),
+            ("requiredDirectories", "directory"),
+            ("required_directories", "directory"),
+            ("requiredDirs", "directory"),
+            ("required_dirs", "directory"),
+            ("requiredPaths", "path"),
+            ("required_paths", "path"),
+        ):
+            value = container.get(field)
+            if value is None:
+                continue
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, dict):
+                    path_value = item.get("path")
+                    kind = str(item.get("type") or item.get("kind") or expected_kind)
+                    reason = item.get("reason")
+                else:
+                    path_value = item
+                    kind = expected_kind
+                    reason = None
+                yield f"{prefix}.{field}", path_value, kind, reason
+
+
+def plan_required_path_blockers(plan: dict[str, Any] | None, project_root: Path) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for source, path_value, kind, reason in iter_plan_required_path_specs(plan):
+        if not has_text(path_value):
+            blockers.append({"reason": "required plan path is missing", "source": source, "path": "", "kind": kind, "detail": "path is empty"})
+            continue
+        raw_path = Path(str(path_value)).expanduser()
+        path = raw_path if raw_path.is_absolute() else project_root / raw_path
+        normalized_kind = str(kind).lower().replace("-", "_")
+        if normalized_kind in {"file", "required_file"}:
+            if not path.exists():
+                blockers.append({"reason": "required plan path is missing", "source": source, "path": str(path), "kind": "file", "detail": reason})
+            elif not path.is_file():
+                blockers.append({"reason": "required plan path is not a file", "source": source, "path": str(path), "kind": "file", "detail": reason})
+        elif normalized_kind in {"directory", "dir", "required_directory"}:
+            if not path.exists():
+                blockers.append({"reason": "required plan path is missing", "source": source, "path": str(path), "kind": "directory", "detail": reason})
+            elif not path.is_dir():
+                blockers.append({"reason": "required plan path is not a directory", "source": source, "path": str(path), "kind": "directory", "detail": reason})
+        elif not path.exists():
+            blockers.append({"reason": "required plan path is missing", "source": source, "path": str(path), "kind": normalized_kind or "path", "detail": reason})
+    return blockers
+
+
+def resolve_step_path(path_value: Any, plan_dir: Path, cwd_path: Path | None = None) -> Path | None:
+    if not has_text(path_value):
+        return None
+    path = Path(str(path_value)).expanduser()
+    if path.is_absolute():
+        return path.resolve(strict=False)
+    base = cwd_path if cwd_path is not None else plan_dir
+    return (base / path).resolve(strict=False)
+
+
+def iter_command_steps(plan: dict[str, Any] | None):
+    if not isinstance(plan, dict):
+        return
+    for scenario_index, scenario in enumerate(as_list(plan.get("scenarios")), 1):
+        if not isinstance(scenario, dict):
+            continue
+        scenario_id = str(scenario.get("id") or f"scenario[{scenario_index}]")
+        for step_index, step in enumerate(as_list(scenario.get("steps")), 1):
+            if not isinstance(step, dict) or step.get("action") != "command":
+                continue
+            step_id = str(step.get("id") or f"step[{step_index}]")
+            yield f"{scenario_id}.{step_id}", step
+
+
+def iter_step_required_path_specs(step: dict[str, Any]):
+    for field, expected_kind in (
+        ("requiredFiles", "file"),
+        ("required_files", "file"),
+        ("requiredDirectories", "directory"),
+        ("required_directories", "directory"),
+        ("requiredDirs", "directory"),
+        ("required_dirs", "directory"),
+        ("requiredPaths", "path"),
+        ("required_paths", "path"),
+    ):
+        value = step.get(field)
+        if value is None:
+            continue
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if isinstance(item, dict):
+                path_value = item.get("path")
+                kind = str(item.get("type") or item.get("kind") or expected_kind)
+                detail = item.get("reason")
+            else:
+                path_value = item
+                kind = expected_kind
+                detail = None
+            yield field, path_value, kind, detail
+
+
+def command_step_path_blocker(path: Path | None, kind: str, location: str, source: str, detail: Any = None) -> dict[str, Any] | None:
+    if path is None:
+        return {"reason": "required command path is missing", "location": location, "source": source, "path": "", "kind": kind, "detail": detail or "path is empty"}
+    normalized_kind = str(kind).lower().replace("-", "_")
+    if normalized_kind in {"file", "required_file"}:
+        if not path.exists():
+            return {"reason": "required command path is missing", "location": location, "source": source, "path": str(path), "kind": "file", "detail": detail}
+        if not path.is_file():
+            return {"reason": "required command path is not a file", "location": location, "source": source, "path": str(path), "kind": "file", "detail": detail}
+    elif normalized_kind in {"directory", "dir", "required_directory"}:
+        if not path.exists():
+            return {"reason": "required command path is missing", "location": location, "source": source, "path": str(path), "kind": "directory", "detail": detail}
+        if not path.is_dir():
+            return {"reason": "required command path is not a directory", "location": location, "source": source, "path": str(path), "kind": "directory", "detail": detail}
+    elif not path.exists():
+        return {"reason": "required command path is missing", "location": location, "source": source, "path": str(path), "kind": normalized_kind or "path", "detail": detail}
+    return None
+
+
+def is_mypy_command(parts: list[str]) -> bool:
+    parts = strip_leading_env_assignments(parts)
+    parts = strip_cross_env_assignments(parts)
+    if not parts:
+        return False
+    executable = Path(parts[0]).name.lower()
+    if executable == "mypy":
+        return True
+    python_like = executable in {"python", "python.exe"} or executable.startswith(("python2", "python3"))
+    if len(parts) >= 3 and python_like and parts[1] == "-m" and parts[2] == "mypy":
+        return True
+    if executable in {"uv", "poetry", "pipenv", "pdm", "rye", "hatch"} and len(parts) >= 3 and parts[1] == "run":
+        return is_mypy_command(parts[2:])
+    return False
+
+
+def plan_command_prerequisite_blockers(plan: dict[str, Any] | None, plan_path: Path, project_root: Path) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    command_base = project_root
+    for location, step in iter_command_steps(plan):
+        cwd_path: Path | None = None
+        cwd_value = step.get("cwd")
+        if cwd_value not in (None, ""):
+            cwd_path = resolve_step_path(cwd_value, command_base)
+            if cwd_path is None:
+                blockers.append({"reason": "command cwd path is missing", "location": location, "path": "", "detail": "cwd is empty"})
+            elif not cwd_path.exists():
+                blockers.append({"reason": "command cwd path is missing", "location": location, "path": str(cwd_path)})
+            elif not cwd_path.is_dir():
+                blockers.append({"reason": "command cwd path is not a directory", "location": location, "path": str(cwd_path)})
+
+        for field, path_value, kind, detail in iter_step_required_path_specs(step):
+            blocker = command_step_path_blocker(resolve_step_path(path_value, command_base, cwd_path), kind, location, field, detail)
+            if blocker:
+                blockers.append(blocker)
+
+        parts = command_parts(step.get("command") or step.get("cmd") or "")
+        service_dir = cwd_path or project_root
+        status = command_status(parts)
+        if parts and not status["found"] and not status.get("substitute"):
+            blockers.append({
+                "reason": "command executable is missing",
+                "location": location,
+                "executable": status.get("executable"),
+            })
+        nested_status = nested_command_status(parts, service_dir, project_root)
+        if nested_status and not nested_status["found"] and not nested_status.get("substitute"):
+            blockers.append({
+                "reason": "command executable is missing",
+                "location": location,
+                "executable": nested_status.get("executable"),
+            })
+        npm_status = npm_script_status(parts, service_dir, project_root)
+        if npm_status and not npm_status["found"]:
+            blockers.append({
+                "reason": "npm script is missing",
+                "location": location,
+                "script": npm_status["script"],
+                "available_scripts": npm_status["available_scripts"],
+                "package_dir": npm_status.get("package_dir"),
+            })
+        node_status = node_dependency_status(parts, service_dir, project_root)
+        if node_status and not node_status["found"]:
+            blockers.append({
+                "reason": "node dependencies are missing",
+                "location": location,
+                "candidates": node_status["candidates"],
+            })
+        if not is_mypy_command(parts):
+            continue
+        for index, part in enumerate(parts):
+            config_value: str | None = None
+            if part == "--config-file" and index + 1 < len(parts):
+                config_value = parts[index + 1]
+            elif part.startswith("--config-file="):
+                config_value = part.split("=", 1)[1]
+            if not config_value:
+                continue
+            config_path = resolve_step_path(config_value, command_base, cwd_path)
+            if config_path is None or not config_path.exists():
+                blockers.append({"reason": "mypy config file is missing", "location": location, "path": str(config_path or config_value)})
+            elif not config_path.is_file():
+                blockers.append({"reason": "mypy config path is not a file", "location": location, "path": str(config_path)})
+    return blockers
 
 
 def plan_text(plan: dict[str, Any]) -> str:
@@ -122,19 +619,16 @@ def infer_required_services(context: dict[str, Any], plan: dict[str, Any] | None
     adapter = context.get("adapter")
     base_url = str((plan or {}).get("baseUrl") or context.get("base_url") or "")
     required: set[str] = set()
-    if adapter == "opc_project":
-        for marker, services in OPC_REQUIRED_FOR_BASE_URL.items():
-            if marker in base_url:
-                required.update(services)
+    definition = get_adapter_definition(str(adapter))
+    if definition:
+        preflight = definition.get("preflight") if isinstance(definition.get("preflight"), dict) else {}
+        for marker, services in (preflight.get("base_url_contains") or {}).items():
+            if str(marker) in base_url:
+                required.update(str(item) for item in as_list(services) if str(item))
         text = plan_text(plan or {})
-        if "/api/v1/" in text:
-            required.add("opc-bot")
-        if "/api/v1/agents/ask/ws" in text or "websocket" in text:
-            required.add("opc-bot")
-            if "8000" in base_url:
-                required.add("agent_platform")
-        if "/aibox" in text:
-            required.add("one_corpus_web")
+        for marker, services in (preflight.get("plan_text_contains") or {}).items():
+            if str(marker).lower() in text:
+                required.update(str(item) for item in as_list(services) if str(item))
     else:
         for service in as_list(context.get("services")):
             if service.get("default_url") and service.get("default_url") == base_url:
@@ -143,7 +637,10 @@ def infer_required_services(context: dict[str, Any], plan: dict[str, Any] | None
 
 
 def env_file_status(service_id: str, context: dict[str, Any], project_root: Path) -> dict[str, Any]:
-    candidates = OPC_ENV_CANDIDATES.get(service_id, []) if context.get("adapter") == "opc_project" else []
+    definition = get_adapter_definition(str(context.get("adapter") or ""))
+    preflight = definition.get("preflight") if isinstance((definition or {}).get("preflight"), dict) else {}
+    env_candidates = preflight.get("env_candidates") if isinstance(preflight.get("env_candidates"), dict) else {}
+    candidates = [str(item) for item in as_list(env_candidates.get(service_id)) if str(item)]
     existing = [item for item in candidates if (project_root / item).exists()]
     return {
         "candidates": candidates,
@@ -160,7 +657,8 @@ def assess_service(service: dict[str, Any], context: dict[str, Any], project_roo
     warnings: list[dict[str, Any]] = []
     start_parts = command_parts(str(service.get("start_command") or ""))
     cmd_status = command_status(start_parts)
-    npm_status = npm_script_status(start_parts, service_dir)
+    npm_status = npm_script_status(start_parts, service_dir, project_root)
+    node_status = node_dependency_status(start_parts, service_dir, project_root)
     env_status = env_file_status(service_id, context, project_root)
 
     item = {
@@ -179,6 +677,7 @@ def assess_service(service: dict[str, Any], context: dict[str, Any], project_roo
             "command_text": service.get("start_command", ""),
             "command_status": cmd_status,
             "npm_script_status": npm_status,
+            "node_dependency_status": node_status,
         },
         "env_files": env_status,
     }
@@ -192,7 +691,9 @@ def assess_service(service: dict[str, Any], context: dict[str, Any], project_roo
     if required and start_parts and not cmd_status["found"] and not cmd_status.get("substitute"):
         blockers.append({"service": service_id, "reason": "start command executable is missing", "executable": cmd_status.get("executable")})
     if required and npm_status and not npm_status["found"]:
-        blockers.append({"service": service_id, "reason": "npm script is missing", "script": npm_status["script"]})
+        blockers.append({"service": service_id, "reason": "npm script is missing", "script": npm_status["script"], "package_dir": npm_status.get("package_dir")})
+    if required and node_status and not node_status["found"]:
+        blockers.append({"service": service_id, "reason": "node dependencies are missing", "candidates": node_status["candidates"]})
     if required and env_status["candidates"] and not env_status["existing"]:
         blockers.append({"service": service_id, "reason": "expected env/config file path is missing", "candidates": env_status["candidates"]})
     if required and env_status["existing"] and not env_status["has_non_example"]:
@@ -341,7 +842,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
                 boundary["runtime_mode"] = args.runtime_mode
             if args.data_boundary_status:
                 boundary["data_boundary_status"] = args.data_boundary_status
-            context_path.write_text(json.dumps(context, indent=2, ensure_ascii=False), encoding="utf-8")
+            write_json(context_path, context)
     plan_path = Path(args.plan).expanduser().resolve() if args.plan else run_dir / "test-plan.json"
     plan = None
     if plan_path.exists():
@@ -371,6 +872,8 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         blockers.extend(service_blockers)
         warnings.extend(service_warnings)
     blockers.extend(missing_required_service_blockers(required_ids, services))
+    blockers.extend(plan_required_path_blockers(plan, project_root))
+    blockers.extend(plan_command_prerequisite_blockers(plan, plan_path, project_root))
 
     if context.get("environment_boundary", {}).get("runtime_mode") == "unconfirmed":
         warnings.append({"reason": "runtime mode is unconfirmed; report must state local/test/staging/prod before pass/fail"})

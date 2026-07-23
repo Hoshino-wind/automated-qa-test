@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "id": "opc_project",
+  "display_name": "OPC multi-service project",
+  "markers": [
+    "one_corpus_web/package.json",
+    "opc-bot/go.mod",
+    "agent_platform/pyproject.toml"
+  ],
+  "services": [
+    {
+      "id": "one_corpus_web",
+      "role": "user-facing Vite app",
+      "path": "one_corpus_web",
+      "default_url": "http://127.0.0.1:9527",
+      "start_command": "npm run dev"
+    },
+    {
+      "id": "opc-bot",
+      "role": "Go Gin business API",
+      "path": "opc-bot",
+      "default_url": "http://127.0.0.1:8081",
+      "start_command": "go run ./cmd/bot-chat"
+    },
+    {
+      "id": "agent_platform",
+      "role": "FastAPI agent engine",
+      "path": "agent_platform",
+      "default_url": "http://127.0.0.1:8000",
+      "start_command": "python -m app.main"
+    },
+    {
+      "id": "ops_web",
+      "role": "operations console",
+      "path": "ops_web",
+      "default_url": "http://127.0.0.1:3070",
+      "start_command": "npm run dev"
+    }
+  ],
+  "data_boundaries": [
+    "PostgreSQL owns user-editable platform data and chat/session state.",
+    "Elasticsearch owns knowledge metadata/chunks.",
+    "MinIO owns uploaded/generated files.",
+    "Redis is cache only.",
+    "one_corpus_web /api/v1/* normally proxies to opc-bot on 127.0.0.1:8081."
+  ],
+  "evidence_layers": [
+    {
+      "id": "environment_boundary",
+      "strong_signal": "Report states local/test/staging/prod and mock/seed/real data boundary before pass/fail.",
+      "weak_signal_to_avoid": "A generic pass/fail without naming the runtime data boundary."
+    },
+    {
+      "id": "catalog_ui_seed",
+      "strong_signal": "Visible catalog state is tied to current UI/API/seed evidence.",
+      "weak_signal_to_avoid": "Treating hardcoded cards or local seed rows as online production configuration."
+    },
+    {
+      "id": "frontend_fallback",
+      "strong_signal": "Rendered reply is identified as real stream output or explicitly labeled fallback/optimistic UI.",
+      "weak_signal_to_avoid": "Counting fallback text as backend completion."
+    },
+    {
+      "id": "real_stream_completion",
+      "strong_signal": "WebSocket/SSE/HTTP stream emits a terminal event for the same run marker.",
+      "weak_signal_to_avoid": "Matching the unique marker only in user input or prompt text."
+    },
+    {
+      "id": "persistence_terminal_state",
+      "strong_signal": "Read-only persistence/log evidence shows the same session/turn reaches completed.",
+      "weak_signal_to_avoid": "Inferring DB completion from a successful screenshot."
+    }
+  ],
+  "preflight": {
+    "env_candidates": {
+      "one_corpus_web": ["one_corpus_web/.env.local", "one_corpus_web/.env.localdesktop", "one_corpus_web/.env.example"],
+      "opc-bot": ["opc-bot/configs/config.yaml"],
+      "agent_platform": ["agent_platform/.env", "agent_platform/.env.example"],
+      "ops_web": ["ops_web/.env.local", "ops_web/.env.example"]
+    },
+    "base_url_contains": {
+      "9527": ["one_corpus_web", "opc-bot"],
+      "8081": ["opc-bot"],
+      "8000": ["agent_platform"],
+      "3070": ["ops_web"]
+    },
+    "plan_text_contains": {
+      "/api/v1/": ["opc-bot"],
+      "/api/v1/agents/ask/ws": ["opc-bot"],
+      "/aibox": ["one_corpus_web"]
+    }
+  },
+  "probe_template": {
+    "kind": "chat_stream_session",
+    "required_services": ["opc-bot"],
+    "base_url_service_rules": {
+      "9527": ["one_corpus_web"]
+    },
+    "ws_path": "/api/v1/agents/ask/ws",
+    "session_detail_path": "/api/v1/sessions/",
+    "terminal_type": "answer_done"
+  }
+}

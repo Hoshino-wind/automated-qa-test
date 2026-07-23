@@ -4,10 +4,10 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import os from "node:os";
+import { createHash } from "node:crypto";
 
 function usage() {
-  console.log("Usage: playwright_probe.mjs --plan <test-plan.json>");
+  console.log("Usage: playwright_probe.mjs --plan <test-plan.json> [--plan-audit-summary <plan-audit-summary.json>]");
 }
 
 function argValue(name) {
@@ -129,6 +129,32 @@ function boundedText(value, maxChars = 1200) {
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function planNeedsCommand(plan) {
+  return (plan.scenarios || []).some((scenario) =>
+    (scenario.steps || []).some((step) => step && step.action === "command"),
+  );
+}
+
+async function sha256File(file) {
+  const content = await fs.readFile(file);
+  return createHash("sha256").update(content).digest("hex");
+}
+
+async function validateCommandPlanBinding(plan, planPath, auditPath) {
+  if (!planNeedsCommand(plan)) return;
+  if (!auditPath) {
+    throw new Error("Command plans require --plan-audit-summary; refusing to execute an unvalidated local command.");
+  }
+  const audit = JSON.parse(await fs.readFile(auditPath, "utf-8"));
+  const expectedPlan = path.resolve(planPath);
+  const boundPlan = audit.plan ? path.resolve(String(audit.plan)) : "";
+  const expectedHash = await sha256File(planPath);
+  const boundHash = audit.artifact_hashes?.plan_sha256;
+  if (audit.passed !== true) throw new Error("Command plan audit is not passed.");
+  if (boundPlan !== expectedPlan) throw new Error("Command plan audit path does not match --plan.");
+  if (!boundHash || boundHash !== expectedHash) throw new Error("Command plan changed after validation; SHA-256 binding mismatch.");
 }
 
 function resolveRuntimeRefs(value, ctx) {
@@ -582,6 +608,21 @@ function responseMatchesStep(response, step, ctx) {
   return true;
 }
 
+function requestMatchesStep(request, step, ctx) {
+  const url = typeof request.url === "function" ? request.url() : String(request.url || "");
+  const method = (typeof request.method === "function" ? request.method() : String(request.method || "")).toUpperCase();
+  const expectedMethod = step.method ? String(step.method).toUpperCase() : "";
+  if (expectedMethod && method !== expectedMethod) return false;
+  if (step.url && url !== String(step.url)) return false;
+  if (step.pathTemplate && url !== resolveUrl(ctx.baseUrl, { pathTemplate: step.pathTemplate, encodePathVars: step.encodePathVars }, ctx)) return false;
+  if (step.path && url !== resolveUrl(ctx.baseUrl, { path: step.path }, ctx)) return false;
+  if (step.urlContains && !url.includes(String(step.urlContains))) return false;
+  if (step.responseUrlContains && !url.includes(String(step.responseUrlContains))) return false;
+  if (step.urlPattern && !new RegExp(String(step.urlPattern)).test(url)) return false;
+  if (step.responseUrlPattern && !new RegExp(String(step.responseUrlPattern)).test(url)) return false;
+  return true;
+}
+
 async function captureHttpResponse(record, response, step, ctx, scenario, artifactName) {
   if ((step.captureRequestBody || step.capture_request_body) && typeof response.request === "function") {
     const request = response.request();
@@ -800,32 +841,56 @@ async function runCommand(step, ctx) {
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const child = spawn(command, args, { cwd, env, shell: useShell });
+    let timedOut = false;
+    const maxOutputChars = Math.max(Number(ctx.maxArtifactChars || 10000), 1000);
+    const detached = process.platform !== "win32";
+    const child = spawn(command, args, { cwd, env, shell: useShell, detached });
+    let killTimer;
+    let forceResolveTimer;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      clearTimeout(forceResolveTimer);
+      resolve(payload);
+    };
+    const appendBounded = (current, chunk) => {
+      const combined = current + chunk.toString();
+      if (combined.length <= maxOutputChars) return combined;
+      return `[truncated to last ${maxOutputChars} chars]\n${combined.slice(-maxOutputChars)}`;
+    };
+    const signalTree = (signal) => {
+      try {
+        if (detached && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (_) {
+        // 进程可能已在信号发出前退出，由 close/error 事件收口。
+      }
+    };
     const timer = setTimeout(() => {
       if (!settled) {
-        child.kill("SIGTERM");
-        settled = true;
-        resolve({ exitCode: null, timedOut: true, stdout, stderr });
+        timedOut = true;
+        signalTree("SIGTERM");
+        killTimer = setTimeout(() => signalTree("SIGKILL"), 1000);
+        forceResolveTimer = setTimeout(
+          () => finish({ exitCode: null, timedOut: true, stdout, stderr }),
+          3000,
+        );
       }
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      stdout = appendBounded(stdout, chunk);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      stderr = appendBounded(stderr, chunk);
     });
     child.on("error", (error) => {
-      if (settled) return;
-      clearTimeout(timer);
-      settled = true;
-      resolve({ exitCode: null, error: error.message || String(error), stdout, stderr });
+      finish({ exitCode: null, timedOut, error: error.message || String(error), stdout, stderr });
     });
     child.on("close", (code) => {
-      if (settled) return;
-      clearTimeout(timer);
-      settled = true;
-      resolve({ exitCode: code, stdout, stderr });
+      finish({ exitCode: code, timedOut, stdout, stderr });
     });
   });
 }
@@ -1004,6 +1069,8 @@ async function runSseProbe(page, url, step) {
 async function runStep(page, context, scenario, rawStep, ctx) {
   let step = rawStep;
   const startedAt = new Date().toISOString();
+  const previousStepStartedAt = (ctx.lastStepStartedAtByScenario && ctx.lastStepStartedAtByScenario[scenario.id]) || startedAt;
+  if (ctx.lastStepStartedAtByScenario) ctx.lastStepStartedAtByScenario[scenario.id] = startedAt;
   const record = {
     scenarioId: scenario.id,
     stepId: rawStep.id || "",
@@ -1133,6 +1200,38 @@ async function runStep(page, context, scenario, rawStep, ctx) {
       if (failures.length) throw new Error(`Request failures present: ${failures.length}`);
       record.checkedRequestFailures = 0;
       record.ignoredRequestFailures = ctx.result.requestFailures.length - failures.length;
+    } else if (step.action === "expectNoRequest") {
+      await page.waitForTimeout(step.waitMs || 500);
+      const ignore = (step.ignorePatterns || []).map((item) => new RegExp(String(item)));
+      const observationStartedAt = step.sinceStartedAt || previousStepStartedAt;
+      const observationStartedMs = Date.parse(observationStartedAt);
+      const scopedRequests = Number.isFinite(observationStartedMs)
+        ? (ctx.result.requests || []).filter((item) => {
+          const requestTime = Date.parse(item.time || "");
+          return Number.isFinite(requestTime) && requestTime >= observationStartedMs;
+        })
+        : (ctx.result.requests || []);
+      const matches = scopedRequests.filter((item) => {
+        const haystack = `${item.method || ""} ${item.url || ""}`;
+        return requestMatchesStep(item, step, ctx) && !ignore.some((pattern) => pattern.test(haystack));
+      });
+      record.checkedNoRequest = 0;
+      record.observationStartedAt = observationStartedAt;
+      record.ignoredRequests = scopedRequests.filter((item) => {
+        const haystack = `${item.method || ""} ${item.url || ""}`;
+        return requestMatchesStep(item, step, ctx) && ignore.some((pattern) => pattern.test(haystack));
+      }).length;
+      record.checkedRequestMethod = step.method ? String(step.method).toUpperCase() : "";
+      record.checkedRequestTarget = step.path || step.pathTemplate || step.url || step.urlContains || step.urlPattern || step.responseUrlContains || step.responseUrlPattern || "";
+      if (matches.length) {
+        record.matchingRequests = matches.slice(0, Number(step.maxMatches || 5)).map((item) => ({
+          method: item.method,
+          url: item.url,
+          resourceType: item.resourceType,
+          time: item.time,
+        }));
+        throw new Error(`Forbidden request observed: ${matches.length}`);
+      }
     } else if (step.action === "expectNoFailedResponses") {
       const ignore = (step.ignorePatterns || []).map((item) => new RegExp(String(item)));
       const failures = ctx.result.failedResponses.filter((item) => {
@@ -1313,6 +1412,15 @@ function skippedStepRecord(scenario, rawStep, reason) {
   });
 }
 
+function planNeedsBrowser(plan) {
+  for (const scenario of plan.scenarios || []) {
+    for (const step of scenario.steps || []) {
+      if (step && step.action !== "command") return true;
+    }
+  }
+  return false;
+}
+
 async function launchBrowser(chromium, plan) {
   const launchOptions = { ...(plan.launchOptions || {}), headless: plan.headless !== false };
   if (plan.channel) launchOptions.channel = plan.channel;
@@ -1342,7 +1450,6 @@ async function loadPlaywright(planPath, plan) {
       path.join(cwd, "ops_web"),
       path.join(cwd, "agent_platform", "web"),
       path.dirname(planPath),
-      path.join(os.homedir(), ".codex", "skills", "pixel-twin-lab"),
     ].filter(Boolean);
 
     for (const candidate of candidates) {
@@ -1358,7 +1465,7 @@ async function loadPlaywright(planPath, plan) {
           }
         }
       } catch (_) {
-        // Candidate does not look like a package root.
+        // 候选路径不像包根目录。
       }
     }
 
@@ -1373,6 +1480,7 @@ async function main() {
   }
 
   const planPath = argValue("--plan");
+  const planAuditSummaryPath = argValue("--plan-audit-summary");
   if (!planPath) {
     usage();
     return 2;
@@ -1386,14 +1494,28 @@ async function main() {
     console.error(error.message || String(error));
     return 2;
   }
-
-  let chromium;
+  if (plan.schemaVersion !== 2) {
+    console.error(`Unsupported plan.schemaVersion: ${JSON.stringify(plan.schemaVersion)}; expected 2.`);
+    return 2;
+  }
   try {
-    ({ chromium } = await loadPlaywright(path.resolve(planPath), plan));
+    await validateCommandPlanBinding(plan, planPath, planAuditSummaryPath);
   } catch (error) {
-    console.error("Could not import Playwright. Install project dependencies or run from a workspace that has playwright available.");
+    console.error("Command plan validation binding failed.");
     console.error(error.message || String(error));
     return 2;
+  }
+
+  const needsBrowser = planNeedsBrowser(plan);
+  let chromium;
+  if (needsBrowser) {
+    try {
+      ({ chromium } = await loadPlaywright(path.resolve(planPath), plan));
+    } catch (error) {
+      console.error("Could not import Playwright. Install project dependencies or run from a workspace that has playwright available.");
+      console.error(error.message || String(error));
+      return 2;
+    }
   }
 
   const artifactDir = path.resolve(plan.artifactDir || path.dirname(planPath));
@@ -1418,48 +1540,62 @@ async function main() {
     scenarios: [],
     console: [],
     failedResponses: [],
+    requests: [],
     requestFailures: [],
     webSockets: [],
   };
 
-  const browser = await launchBrowser(chromium, plan);
-  const contextOptions = {
-    ...(plan.contextOptions || {}),
-    viewport: plan.viewport || (plan.contextOptions || {}).viewport || { width: 1440, height: 980 },
-  };
-  if (plan.storageState) contextOptions.storageState = plan.storageState;
-  if (plan.extraHTTPHeaders) contextOptions.extraHTTPHeaders = plan.extraHTTPHeaders;
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
+  let browser = null;
+  let context = null;
+  let page = null;
+  if (needsBrowser) {
+    browser = await launchBrowser(chromium, plan);
+    const contextOptions = {
+      ...(plan.contextOptions || {}),
+      viewport: plan.viewport || (plan.contextOptions || {}).viewport || { width: 1440, height: 980 },
+    };
+    if (plan.storageState) contextOptions.storageState = plan.storageState;
+    if (plan.extraHTTPHeaders) contextOptions.extraHTTPHeaders = plan.extraHTTPHeaders;
+    context = await browser.newContext(contextOptions);
+    page = await context.newPage();
 
-  page.on("console", (msg) => {
-    if (["error", "warning"].includes(msg.type())) {
-      result.console.push(redact({ type: msg.type(), text: msg.text(), url: page.url(), time: new Date().toISOString() }));
-    }
-  });
-  page.on("response", (response) => {
-    if (response.status() >= 400) {
-      result.failedResponses.push(redact({ status: response.status(), url: response.url(), time: new Date().toISOString() }));
-    }
-  });
-  page.on("requestfailed", (request) => {
-    result.requestFailures.push(redact({
-      method: request.method(),
-      url: request.url(),
-      failure: request.failure()?.errorText || "",
-      time: new Date().toISOString(),
-    }));
-  });
-  if (plan.captureWebSockets !== false) {
-    page.on("websocket", (ws) => {
-      const entry = redact({ url: ws.url(), openedAt: new Date().toISOString(), framesSent: [], framesReceived: [] });
-      result.webSockets.push(entry);
-      ws.on("framesent", (event) => entry.framesSent.push({ time: new Date().toISOString(), payload: boundedText(event.payload, 500) }));
-      ws.on("framereceived", (event) => entry.framesReceived.push({ time: new Date().toISOString(), payload: boundedText(event.payload, 500) }));
-      ws.on("close", () => {
-        entry.closedAt = new Date().toISOString();
-      });
+    page.on("console", (msg) => {
+      if (["error", "warning"].includes(msg.type())) {
+        result.console.push(redact({ type: msg.type(), text: msg.text(), url: page.url(), time: new Date().toISOString() }));
+      }
     });
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        result.failedResponses.push(redact({ status: response.status(), url: response.url(), time: new Date().toISOString() }));
+      }
+    });
+    page.on("request", (request) => {
+      result.requests.push(redact({
+        method: request.method(),
+        url: request.url(),
+        resourceType: request.resourceType(),
+        time: new Date().toISOString(),
+      }));
+    });
+    page.on("requestfailed", (request) => {
+      result.requestFailures.push(redact({
+        method: request.method(),
+        url: request.url(),
+        failure: request.failure()?.errorText || "",
+        time: new Date().toISOString(),
+      }));
+    });
+    if (plan.captureWebSockets !== false) {
+      page.on("websocket", (ws) => {
+        const entry = redact({ url: ws.url(), openedAt: new Date().toISOString(), framesSent: [], framesReceived: [] });
+        result.webSockets.push(entry);
+        ws.on("framesent", (event) => entry.framesSent.push({ time: new Date().toISOString(), payload: boundedText(event.payload, 500) }));
+        ws.on("framereceived", (event) => entry.framesReceived.push({ time: new Date().toISOString(), payload: boundedText(event.payload, 500) }));
+        ws.on("close", () => {
+          entry.closedAt = new Date().toISOString();
+        });
+      });
+    }
   }
 
   const ctx = {
@@ -1470,6 +1606,7 @@ async function main() {
     maxArtifactChars: Number(plan.maxArtifactChars || 10000),
     result,
     vars: runtimeVars,
+    lastStepStartedAtByScenario: Object.create(null),
   };
 
   for (const scenario of plan.scenarios || []) {
@@ -1498,7 +1635,7 @@ async function main() {
     result.console.some((m) => m.type === "error")
     ? "attention"
     : "passed";
-  await browser.close();
+  if (browser) await browser.close();
 
   const resultPath = path.join(artifactDir, "results.json");
   await fs.writeFile(resultPath, JSON.stringify(redact(result), null, 2), "utf-8");

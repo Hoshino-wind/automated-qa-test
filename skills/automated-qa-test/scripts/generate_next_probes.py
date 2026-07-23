@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json
 
 SENSITIVE_QUERY_PARAM_RE = re.compile(r"(?:access[_-]?token|auth[_-]?token|token|session|cookie|key|api[_-]?key|secret)", re.IGNORECASE)
 
@@ -37,8 +38,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def file_sha256(path: Path | None) -> str | None:

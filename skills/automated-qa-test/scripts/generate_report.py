@@ -1,33 +1,19 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
 import json
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
-EVIDENCE_ARTIFACT_PATH_FIELDS = (
-    "path",
-    "file",
-    "body_path",
-    "response_body_path",
-    "request_body_path",
-    "messages_path",
-    "stdout_path",
-    "stderr_path",
+from qa_common import atomic_write_text, file_sha256
+from qa_core.contracts.evidence import (
+    boundary_field_confirmed,
+    defect_finding_summary,
+    evidence_artifact_paths,
+    has_text,
+    path_matches,
+    resolved_path,
 )
-UNCONFIRMED_BOUNDARY_VALUES = {
-    "",
-    "unconfirmed",
-    "unknown",
-    "unset",
-    "todo",
-    "tbd",
-    "must be stated before pass/fail",
-    "must be stated",
-}
 
 
 def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -46,112 +32,22 @@ def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return value, None
 
 
-def file_sha256(path: Path) -> str | None:
-    if path.is_dir():
-        return None
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    return digest.hexdigest()
 
 
-def has_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
 
 
-def nonnegative_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int) and value >= 0:
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
 
 
-def defect_finding_summary(defects: dict | None) -> dict[str, Any]:
-    if not defects:
-        return {
-            "finding_count": 0,
-            "summary_count": None,
-            "findings_count": 0,
-            "invalid_summary_count": False,
-            "severity_counts": {},
-        }
-    summary = defects.get("summary") if isinstance(defects.get("summary"), dict) else {}
-    findings = defects.get("findings") if isinstance(defects.get("findings"), list) else []
-    summary_declared = "finding_count" in summary
-    summary_count = nonnegative_int(summary.get("finding_count")) if summary_declared else None
-    findings_count = len(findings)
-    effective_count = max(summary_count or 0, findings_count)
-    severity_counts = summary.get("severity_counts") if isinstance(summary.get("severity_counts"), dict) else {}
-    if findings and (not severity_counts or summary_count != findings_count):
-        counted = Counter(str(item.get("severity") or "unknown") for item in findings if isinstance(item, dict))
-        severity_counts = dict(sorted(counted.items()))
-    return {
-        "finding_count": effective_count,
-        "summary_count": summary_count,
-        "findings_count": findings_count,
-        "invalid_summary_count": summary_declared and summary_count is None,
-        "severity_counts": severity_counts,
-    }
 
 
-def path_matches(recorded: Any, expected: Path | None) -> bool:
-    if not recorded or expected is None:
-        return False
-    try:
-        return Path(str(recorded)).expanduser().resolve() == expected.expanduser().resolve()
-    except OSError:
-        return False
 
 
-def resolved_path(value: Any) -> Path | None:
-    if not value:
-        return None
-    try:
-        return Path(str(value)).expanduser().resolve()
-    except OSError:
-        return None
 
 
-def resolve_artifact_path(base_dir: Path | None, value: str) -> Path:
-    path = Path(value).expanduser()
-    if path.is_absolute() or base_dir is None:
-        return path.resolve()
-    return (base_dir / path).resolve()
 
 
-def iter_path_values(value: Any):
-    if has_text(value):
-        yield str(value)
-    elif isinstance(value, dict):
-        for child in value.values():
-            yield from iter_path_values(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from iter_path_values(child)
 
 
-def evidence_artifact_paths(ledger: dict | None, base_dir: Path | None) -> list[Path]:
-    paths: list[Path] = []
-    seen: set[str] = set()
-    for item in (ledger or {}).get("evidence", []):
-        if not isinstance(item, dict):
-            continue
-        for field in EVIDENCE_ARTIFACT_PATH_FIELDS:
-            for raw in iter_path_values(item.get(field)):
-                resolved = resolve_artifact_path(base_dir, raw)
-                key = str(resolved)
-                if key in seen:
-                    continue
-                seen.add(key)
-                paths.append(resolved)
-    return paths
 
 
 def status_icon(status: str) -> str:
@@ -166,6 +62,16 @@ def status_icon(status: str) -> str:
         "Untested": "UNTESTED",
         "Inconclusive": "INCONCLUSIVE",
     }.get(value, value.upper())
+
+
+def percent(numerator: int | float, denominator: int | float) -> float | None:
+    if not denominator:
+        return None
+    return round((float(numerator) / float(denominator)) * 100.0, 1)
+
+
+def percent_display(value: Any) -> str:
+    return "n/a" if value is None else str(value)
 
 
 def requirement_result(ledger: dict | None, audit_summary: dict | None) -> str:
@@ -194,6 +100,22 @@ def requirement_status_counts(ledger: dict | None) -> dict[str, int]:
     return counts
 
 
+def pass_claim_coverage_summary(verdict: dict | None, ledger: dict | None, report_guard_errors: list[str] | None = None) -> dict[str, Any]:
+    counts = requirement_status_counts(ledger)
+    total = sum(counts.values())
+    passed = counts.get("Passed", 0)
+    can_claim = bool(verdict and verdict.get("can_claim_pass") is True and not report_guard_errors)
+    return {
+        "status": "evaluated" if ledger else "not_evaluated",
+        "ledger_passed_requirement_percent": percent(passed, total),
+        "pass_claim_coverage_percent": percent(passed, total) if can_claim else 0.0 if ledger else None,
+        "passed_requirement_count": passed,
+        "total_requirement_count": total,
+        "can_claim_pass": can_claim,
+        "semantics": "Pass-claim coverage requires every audited requirement to be Passed and qa-verdict.json can_claim_pass=true.",
+    }
+
+
 def runtime_disposition_rows(ledger: dict | None) -> list[dict]:
     if not ledger:
         return []
@@ -207,6 +129,8 @@ def runtime_disposition_rows(ledger: dict | None) -> list[dict]:
             ("ignored_console_errors", "ignored console errors"),
             ("checked_request_failures", "unignored request failures"),
             ("ignored_request_failures", "ignored request failures"),
+            ("checked_no_request", "forbidden matching requests"),
+            ("ignored_requests", "ignored matching forbidden requests"),
             ("checked_failed_responses", "unignored failed HTTP responses"),
             ("ignored_failed_responses", "ignored failed HTTP responses"),
         ):
@@ -296,7 +220,7 @@ def pass_claim_label(verdict: dict | None, report_guard_errors: list[str] | None
 
 
 def is_unconfirmed_boundary_value(value: Any) -> bool:
-    return str(value or "").strip().lower() in UNCONFIRMED_BOUNDARY_VALUES
+    return not boundary_field_confirmed(value)
 
 
 def conclusion_artifact_errors(
@@ -759,6 +683,7 @@ def main() -> int:
     report_guard_errors.extend(semantic_guard_errors)
     semantic_artifacts_renderable = not semantic_guard_errors
     final_pass_allowed = bool(verdict and verdict.get("can_claim_pass") is True and not report_guard_errors)
+    pass_claim_coverage = pass_claim_coverage_summary(verdict, ledger, report_guard_errors)
 
     lines = []
     lines.append("# 自动化 QA-Test Report")
@@ -859,8 +784,15 @@ def main() -> int:
         )
     if semantic_artifacts_renderable and qa_metrics:
         metric_summary = qa_metrics.get("summary") if isinstance(qa_metrics.get("summary"), dict) else {}
+        quality_scores = qa_metrics.get("quality_scores") if isinstance(qa_metrics.get("quality_scores"), dict) else {}
+        coverage_breakdown = qa_metrics.get("coverage_breakdown") if isinstance(qa_metrics.get("coverage_breakdown"), dict) else {}
+        source_mapped = coverage_breakdown.get("source_mapped") if isinstance(coverage_breakdown.get("source_mapped"), dict) else {}
+        executable = coverage_breakdown.get("executable") if isinstance(coverage_breakdown.get("executable"), dict) else {}
         lines.append(
-            f"- QA metrics: automation_readiness={qa_metrics.get('effectiveness_metrics', {}).get('automation_readiness')}, manual_intervention_points={qa_metrics.get('effectiveness_metrics', {}).get('manual_intervention_points')}, requirements={metric_summary.get('requirement_count', 0)} (`{qa_metrics_path}`)"
+            f"- QA metrics: automation_readiness={qa_metrics.get('effectiveness_metrics', {}).get('automation_readiness')}, manual_intervention_points={qa_metrics.get('effectiveness_metrics', {}).get('manual_intervention_points')}, overall_quality_proxy_percent={quality_scores.get('overall_quality_proxy_percent', 'n/a')}, requirements={metric_summary.get('requirement_count', 0)} (`{qa_metrics_path}`)"
+        )
+        lines.append(
+            f"- Coverage semantics: source_mapped={percent_display(source_mapped.get('percent'))}%, executable={percent_display(executable.get('percent'))}%, pass_claim={percent_display(pass_claim_coverage.get('pass_claim_coverage_percent'))}%."
         )
     if semantic_artifacts_renderable and closeout_candidates:
         lines.append(
@@ -1051,6 +983,10 @@ def main() -> int:
         lines.append(f"- Artifact: `{qa_metrics_path}`")
         metric_summary = qa_metrics.get("summary") if isinstance(qa_metrics.get("summary"), dict) else {}
         effectiveness = qa_metrics.get("effectiveness_metrics") if isinstance(qa_metrics.get("effectiveness_metrics"), dict) else {}
+        quality_scores = qa_metrics.get("quality_scores") if isinstance(qa_metrics.get("quality_scores"), dict) else {}
+        quality_targets = qa_metrics.get("quality_targets") if isinstance(qa_metrics.get("quality_targets"), dict) else {}
+        quality_inputs = qa_metrics.get("quality_inputs") if isinstance(qa_metrics.get("quality_inputs"), dict) else {}
+        coverage_breakdown = qa_metrics.get("coverage_breakdown") if isinstance(qa_metrics.get("coverage_breakdown"), dict) else {}
         lines.append("| Metric | Value |")
         lines.append("| --- | --- |")
         for key in (
@@ -1067,6 +1003,18 @@ def main() -> int:
             lines.append(f"| {key} | {table_cell(metric_summary.get(key, 0))} |")
         for key, value in effectiveness.items():
             lines.append(f"| {key} | {table_cell(value)} |")
+        for key, value in quality_scores.items():
+            lines.append(f"| quality_scores.{key} | {table_cell(value)} |")
+        for key, value in quality_targets.items():
+            lines.append(f"| quality_targets.{key} | {table_cell(value)} |")
+        for key, value in coverage_breakdown.items():
+            lines.append(f"| coverage_breakdown.{key} | {table_cell(json.dumps(value, ensure_ascii=False, sort_keys=True), 1000)} |")
+        lines.append(f"| coverage_breakdown.pass_claim.actual | {table_cell(json.dumps(pass_claim_coverage, ensure_ascii=False, sort_keys=True), 1000)} |")
+        for key, value in quality_inputs.items():
+            if key == "business_model_checks":
+                lines.append(f"| quality_inputs.{key} | {table_cell(json.dumps(value, ensure_ascii=False, sort_keys=True), 900)} |")
+            else:
+                lines.append(f"| quality_inputs.{key} | {table_cell(value)} |")
         lines.append("")
 
     if semantic_artifacts_renderable and closeout_candidates:
@@ -1538,7 +1486,7 @@ def main() -> int:
         lines.append("")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(out_path, "\n".join(lines))
     print(out_path)
     return 1 if input_errors else 0
 

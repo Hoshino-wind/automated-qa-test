@@ -1,6 +1,6 @@
 # QA Probe Plan Schema
 
-`scripts/playwright_probe.mjs` runs a JSON probe plan. It is a browser-first runner with API, WebSocket, SSE, and local command probes so a QA/backtest run can verify UI behavior, data/API continuity, stream completion, persistence/log checks, and runtime errors in one artifact.
+`scripts/playwright_probe.mjs` runs a schema-v2 JSON probe plan. Formal schemas live under `references/schemas/`. It is a browser-first runner with API, WebSocket, SSE, and local command probes so a QA/backtest run can verify UI behavior, data/API continuity, stream completion, persistence/log checks, and runtime errors in one artifact.
 
 Do not run untrusted plans. `command` steps execute local commands.
 
@@ -128,9 +128,9 @@ Any plan value may reference an environment variable instead of storing a secret
 
 ```json
 {
-  "storageState": { "env": "OPC_QA_STORAGE_STATE" },
+  "storageState": { "env": "QA_STORAGE_STATE" },
   "defaultHeaders": {
-    "Authorization": { "env": "OPC_QA_TOKEN", "prefix": "Bearer " }
+    "Authorization": { "env": "QA_AUTH_TOKEN", "prefix": "Bearer " }
   },
   "scenarios": [
     {
@@ -143,7 +143,7 @@ Any plan value may reference an environment variable instead of storing a secret
           "requirementIds": ["R-auth"],
           "path": "/",
           "values": {
-            "oc_token": { "env": "OPC_QA_TOKEN" }
+            "app_token": { "env": "QA_AUTH_TOKEN" }
           },
           "evidenceType": "auth_setup",
           "proves": "The browser context received a token from the execution environment."
@@ -271,6 +271,7 @@ python3 scripts/run_qa_cycle.py --run-dir <run-dir> --strict-runtime
 - `expectLocatorCount`: assert `expectCount`, `expectAtLeast`, or `expectAtMost`
 - `expectUrlContains`: assert current URL contains text
 - `expectNoConsoleErrors`: assert no captured console errors, with optional `ignorePatterns`
+- `expectNoRequest`: assert no captured browser request matched `method` plus `path`, `pathTemplate`, `url`, `urlContains`, or `urlPattern`; use it after the invalid/cancelled/blocked interaction and set `waitMs` when delayed requests are possible
 - `expectNoRequestFailures`: assert no captured browser request failures, with optional `ignorePatterns`
 - `expectNoFailedResponses`: assert no captured HTTP 4xx/5xx responses, with optional `ignorePatterns`
 
@@ -534,8 +535,8 @@ Use `command` for read-only logs, database verification through existing project
 
 Fields:
 
-- `command` or `cmd`: Array form is preferred. String form runs through a shell.
-- `cwd`, `env`, `timeoutMs`. Auth-like `env` keys such as `TOKEN`, `API_KEY`, or `PASSWORD` must use env/runtime references.
+- `command` or `cmd`: Array form with shell execution disabled is required by default. String form and `shell: true` are rejected by `validate_plan.py` unless `--allow-unsafe-command` is explicit. That flag cannot override the secret boundary: commands that read, export, upload, overwrite, or otherwise mutate secret files remain validation errors.
+- `cwd`, `env`, `timeoutMs`. When `run_qa_cycle.py --project-root <repo>` is supplied, command steps without `cwd` execute from that project root; relative `cwd`, `requiredFiles`, `requiredDirectories`, and `requiredPaths` are validated from the project root or explicit command `cwd`. Without `--project-root`, they resolve from the plan/run directory. Auth-like `env` keys such as `TOKEN`, `API_KEY`, or `PASSWORD` must use env/runtime references.
 - `expectExitCode`: Defaults to `0`.
 - `expectStdoutContains` / `expectStderrContains`: stdout/stderr text assertions. A successful stdout contains check is preserved as `stdout_contains_matched` in the evidence ledger.
 - `expectStdoutJson`: Dot-path assertions against stdout parsed as JSON. Prefer this for read-only persistence helpers that can output structured state.
@@ -545,11 +546,11 @@ Fields:
 
 ## Evidence Mapping
 
-When not using `run_qa_cycle.py`, run the manual sequence:
+When not using `run_qa_cycle.py`, run the manual sequence. Command steps require the exact passed plan-audit summary at runner execution time:
 
 ```bash
 python3 scripts/validate_plan.py --plan <run-dir>/test-plan.json --matrix <run-dir>/test-matrix.json --summary <run-dir>/plan-audit-summary.json
-node scripts/playwright_probe.mjs --plan <run-dir>/test-plan.json
+node scripts/playwright_probe.mjs --plan <run-dir>/test-plan.json --plan-audit-summary <run-dir>/plan-audit-summary.json
 python3 scripts/ledger_from_probe.py --matrix <run-dir>/test-matrix.json --results <run-dir>/results.json --out <run-dir>/evidence-ledger.json
 python3 scripts/audit_evidence.py --matrix <run-dir>/test-matrix.json --results <run-dir>/results.json --ledger <run-dir>/evidence-ledger.json --summary <run-dir>/audit-summary.json
 ```

@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from adapter_registry import get_adapter_definition
+from qa_common import atomic_write_json
 
 VAR_TOKEN_RE = re.compile(r"\{(session_id|turn_id)\}")
 
@@ -37,8 +39,7 @@ def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def as_list(value: Any) -> list[Any]:
@@ -101,11 +102,15 @@ def service_by_id(context: dict[str, Any], service_id: str) -> dict[str, Any] | 
 
 
 def stopped_service_blockers(context: dict[str, Any], base_url: str) -> list[str]:
-    if context.get("adapter") != "opc_project":
+    definition = get_adapter_definition(str(context.get("adapter") or ""))
+    template = definition.get("probe_template") if isinstance((definition or {}).get("probe_template"), dict) else {}
+    if not template:
         return []
-    needed = ["opc-bot"]
-    if "9527" in str(base_url or context.get("base_url") or ""):
-        needed.append("one_corpus_web")
+    needed = [str(item) for item in as_list(template.get("required_services")) if str(item)]
+    resolved_base_url = str(base_url or context.get("base_url") or "")
+    for marker, services in (template.get("base_url_service_rules") or {}).items():
+        if str(marker) in resolved_base_url:
+            needed.extend(str(item) for item in as_list(services) if str(item))
     blockers: list[str] = []
     for service_id in needed:
         service = service_by_id(context, service_id)
@@ -151,7 +156,16 @@ def set_tests_executable(matrix: dict[str, Any], tests: list[dict[str, Any]]) ->
                 req.pop("notes", None)
 
 
-def build_stream_step(tests: list[dict[str, Any]], marker: str, question: str, ws_path: str, agent_id: str | None, user_id: str | None) -> dict[str, Any]:
+def build_stream_step(
+    tests: list[dict[str, Any]],
+    marker: str,
+    question: str,
+    ws_path: str,
+    terminal_type: str,
+    adapter_id: str,
+    agent_id: str | None,
+    user_id: str | None,
+) -> dict[str, Any]:
     test_ids, req_ids = ids_for_tests(tests)
     payload: dict[str, Any] = {
         "question": question,
@@ -163,14 +177,14 @@ def build_stream_step(tests: list[dict[str, Any]], marker: str, question: str, w
         payload["user_id"] = user_id
     return {
         "action": "websocket",
-        "id": "adapter-opc-stream-answer-done",
+        "id": f"adapter-{adapter_id}-stream-terminal",
         "testIds": test_ids,
         "requirementIds": req_ids,
         "path": ws_path,
         "send": payload,
-        "expectJson": {"type": "answer_done"},
+        "expectJson": {"type": terminal_type},
         "expectMessageTextContains": marker,
-        "finishOnJsonTypes": ["answer_done"],
+        "finishOnJsonTypes": [terminal_type],
         "captureMessages": True,
         "timeoutMs": 60000,
         "maxMessages": 80,
@@ -186,15 +200,15 @@ def build_stream_step(tests: list[dict[str, Any]], marker: str, question: str, w
             },
         },
         "evidenceType": "websocket",
-        "proves": "The OPC agent stream emits `answer_done` and the returned stream messages contain the unique marker, proving the marker came back from the stream rather than only from submitted input.",
+        "proves": f"The configured adapter stream emits `{terminal_type}` and returned messages contain the unique current-run marker.",
     }
 
 
-def build_session_api_step(tests: list[dict[str, Any]], marker: str, session_detail_path: str) -> dict[str, Any]:
+def build_session_api_step(tests: list[dict[str, Any]], marker: str, session_detail_path: str, adapter_id: str) -> dict[str, Any]:
     test_ids, req_ids = ids_for_tests(tests)
     return {
         "action": "api",
-        "id": "adapter-opc-session-detail",
+        "id": f"adapter-{adapter_id}-session-detail",
         "testIds": test_ids,
         "requirementIds": req_ids,
         "method": "GET",
@@ -207,11 +221,11 @@ def build_session_api_step(tests: list[dict[str, Any]], marker: str, session_det
     }
 
 
-def build_persistence_step(tests: list[dict[str, Any]], command: str) -> dict[str, Any]:
+def build_persistence_step(tests: list[dict[str, Any]], command: str, adapter_id: str) -> dict[str, Any]:
     test_ids, req_ids = ids_for_tests(tests)
     return {
         "action": "command",
-        "id": "adapter-opc-persistence-check",
+        "id": f"adapter-{adapter_id}-persistence-check",
         "testIds": test_ids,
         "requirementIds": req_ids,
         "command": command_with_runtime_refs(command),
@@ -284,6 +298,12 @@ def synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]
     assert matrix is not None
     original_plan = copy.deepcopy(plan)
     original_matrix = copy.deepcopy(matrix)
+    adapter_id = str(context.get("adapter") or "")
+    adapter_definition = get_adapter_definition(adapter_id)
+    probe_template = adapter_definition.get("probe_template") if isinstance((adapter_definition or {}).get("probe_template"), dict) else {}
+    ws_path = args.ws_path or str(probe_template.get("ws_path") or "")
+    session_detail_path = args.session_detail_path or str(probe_template.get("session_detail_path") or "")
+    terminal_type = str(probe_template.get("terminal_type") or "completed")
 
     req_by_id = {str(req.get("id")): req for req in as_list(matrix.get("requirements")) if has_text(req.get("id"))}
     tests = as_list(matrix.get("tests"))
@@ -318,7 +338,7 @@ def synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]
             scenario.setdefault("steps", []).append(step)
         return True
 
-    if context.get("adapter") != "opc_project":
+    if probe_template.get("kind") != "chat_stream_session" or not ws_path or not session_detail_path:
         blocked.append({
             "layer": "adapter",
             "reason": f"Unsupported adapter `{context.get('adapter')}` for automatic adapter probe synthesis.",
@@ -342,7 +362,7 @@ def synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]
                     "required_inputs": service_blockers + ["start services or pass --allow-stopped-service to prepare a plan without executing it now"],
                 })
             else:
-                step = build_stream_step(stream_tests, marker, question, args.ws_path, args.agent_id, args.user_id)
+                step = build_stream_step(stream_tests, marker, question, ws_path, terminal_type, adapter_id, args.agent_id, args.user_id)
                 record_step(step)
                 executable_tests.extend(stream_tests)
                 recommendations.append({
@@ -350,7 +370,7 @@ def synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]
                     "status": "executable",
                     "test_ids": [test.get("id") for test in stream_tests],
                     "step_id": step["id"],
-                    "strong_signal": "answer_done plus unique marker in received stream messages",
+                    "strong_signal": f"{terminal_type} plus unique marker in received stream messages",
                 })
         else:
             recommendations.append({"layer": "stream", "status": "not_applicable", "reason": "No stream/websocket tests detected in the matrix."})
@@ -364,7 +384,7 @@ def synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]
                     "required_inputs": ["stream step with extractJson.session_id or manual session_id plan"],
                 })
             elif args.allow_live_stream and not service_blockers:
-                step = build_session_api_step(session_api_tests, marker, args.session_detail_path)
+                step = build_session_api_step(session_api_tests, marker, session_detail_path, adapter_id)
                 record_step(step)
                 executable_tests.extend(session_api_tests)
                 recommendations.append({
@@ -398,7 +418,7 @@ def synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]
                     "required_inputs": ["stream step with extractJson variables"],
                 })
             elif args.allow_live_stream and not service_blockers:
-                step = build_persistence_step(persistence_tests, args.persistence_command)
+                step = build_persistence_step(persistence_tests, args.persistence_command, adapter_id)
                 record_step(step)
                 executable_tests.extend(persistence_tests)
                 recommendations.append({
@@ -469,8 +489,8 @@ def main() -> int:
     parser.add_argument("--user-id")
     parser.add_argument("--marker")
     parser.add_argument("--question")
-    parser.add_argument("--ws-path", default="/api/v1/agents/ask/ws")
-    parser.add_argument("--session-detail-path", default="/api/v1/sessions/")
+    parser.add_argument("--ws-path", help="Override the adapter-configured stream path.")
+    parser.add_argument("--session-detail-path", help="Override the adapter-configured session detail path.")
     parser.add_argument("--persistence-command", help="Read-only helper command. Use {session_id} or {turn_id} placeholders for runtime refs.")
     args = parser.parse_args()
 

@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -12,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json
 
 DESTRUCTIVE_COMMAND_RE = re.compile(
     r"\b(rm\s+-rf|mkfs|dd\s+if=|drop\s+table|truncate\s+table|delete\s+from|update\s+\w+\s+set|insert\s+into|gh\s+repo\s+delete|kubectl\s+delete|docker\s+(?:rm|rmi|system\s+prune|compose\s+down))\b",
@@ -49,8 +51,7 @@ def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def as_list(value: Any) -> list[Any]:
@@ -294,6 +295,7 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
                 "started_by": "automated-qa-test/scripts/service_runtime.py",
             }
         )
+        entry["process_identity"] = process_identity(proc.pid)
         report["summary"]["started_count"] += 1
         report["safety"]["services_started"] = True
         if args.no_wait:
@@ -324,23 +326,66 @@ def process_command(pid: int) -> str:
     return proc.stdout.strip()
 
 
+def process_start_time(pid: int) -> str:
+    try:
+        proc = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], text=True, capture_output=True, check=False)
+    except Exception:
+        return ""
+    return " ".join(proc.stdout.split())
+
+
+def command_sha256(command: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def process_identity(pid: int) -> dict[str, Any]:
+    command = process_command(pid)
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+    return {
+        "pid": pid,
+        "pgid": pgid,
+        "command": command,
+        "command_sha256": command_sha256(command) if command else None,
+        "os_started_at": process_start_time(pid) or None,
+    }
+
+
 def process_matches(pid: int, command: list[Any]) -> bool:
     actual = process_command(pid)
-    if not actual:
+    expected = [str(part) for part in command if str(part)]
+    if not actual or not expected:
         return False
-    first = Path(str(command[0])).name if command else ""
-    if first and first in actual:
-        return True
-    remaining = [str(part) for part in command[1:] if str(part)]
-    if not remaining:
+    try:
+        actual_parts = shlex.split(actual)
+    except ValueError:
         return False
-    cursor = 0
-    for token in remaining:
-        found = actual.find(token, cursor)
-        if found == -1:
-            return False
-        cursor = found + len(token)
-    return True
+    if not actual_parts or Path(actual_parts[0]).name != Path(expected[0]).name:
+        return False
+    return actual_parts[1:] == expected[1:]
+
+
+def process_identity_errors(item: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    recorded = item.get("process_identity")
+    if not isinstance(recorded, dict):
+        return ["runtime artifact has no process_identity; legacy PID-only stop is refused"]
+    errors: list[str] = []
+    for field in ("pid", "pgid", "command_sha256", "os_started_at"):
+        if recorded.get(field) is None:
+            errors.append(f"recorded process_identity.{field} is missing")
+        elif current.get(field) != recorded.get(field):
+            errors.append(f"process_identity.{field} does not match the current OS process")
+    if item.get("pid") != recorded.get("pid"):
+        errors.append("service pid does not match process_identity.pid")
+    if item.get("pgid") != recorded.get("pgid"):
+        errors.append("service pgid does not match process_identity.pgid")
+    if recorded.get("command") != current.get("command"):
+        errors.append("process_identity.command does not match the current OS process")
+    return errors
 
 
 def pid_alive(pid: int) -> bool:
@@ -371,6 +416,8 @@ def stop_services(args: argparse.Namespace) -> dict[str, Any]:
         "safety": {
             "only_recorded_service_pids": True,
             "requires_command_match": True,
+            "requires_process_identity_match": True,
+            "requires_process_group_match": True,
         },
         "input_artifact_errors": [],
     }
@@ -392,14 +439,23 @@ def stop_services(args: argparse.Namespace) -> dict[str, Any]:
             report["summary"]["skipped_count"] += 1
             stopped.append(entry)
             continue
-        if not process_matches(pid, command):
+        current_identity = process_identity(pid)
+        identity_errors = process_identity_errors(item, current_identity)
+        if identity_errors:
             entry["status"] = "blocked_by_safety"
-            entry["reason"] = "pid command does not match recorded command"
-            entry["actual_command"] = process_command(pid)
+            entry["reason"] = "current process identity does not exactly match the recorded start identity"
+            entry["errors"] = identity_errors
+            entry["current_process_identity"] = current_identity
             report["summary"]["failed_count"] += 1
             stopped.append(entry)
             continue
-        pgid = item.get("pgid") if isinstance(item.get("pgid"), int) else pid
+        pgid = current_identity.get("pgid")
+        if not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
+            entry["status"] = "blocked_by_safety"
+            entry["reason"] = "recorded process group is invalid or matches the QA controller process group"
+            report["summary"]["failed_count"] += 1
+            stopped.append(entry)
+            continue
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:

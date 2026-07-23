@@ -1,0 +1,18 @@
+[project]
+name = "automated-qa-test-skill"
+version = "0.2.0"
+description = "Evidence-bound automated QA/backtest skill helpers"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+# 夹具保留长需求语料；文本行长由可读性评审而非 CI 数值门禁处理。
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"skills/automated-qa-test/scripts/tests/*.py" = ["E402"]

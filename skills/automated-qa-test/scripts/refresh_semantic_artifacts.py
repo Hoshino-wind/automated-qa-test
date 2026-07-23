@@ -5,14 +5,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json
+from scaffold_artifacts import source_binding, try_read_text, write_semantic_artifacts
 from scaffold_requirement import (
     build_business_model,
     build_closeout_candidates,
     build_oracle_model,
     build_qa_metrics,
-    source_binding,
-    try_read_text,
-    write_semantic_artifacts,
 )
 
 
@@ -47,12 +46,33 @@ def plan_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return steps
 
 
-def coverage_gaps(run_dir: Path, matrix: dict[str, Any]) -> list[str]:
+def binding_sha(summary: dict[str, Any], name: str) -> str | None:
+    bindings = summary.get("source_bindings") if isinstance(summary.get("source_bindings"), dict) else {}
+    binding = bindings.get(name) if isinstance(bindings.get(name), dict) else {}
+    value = binding.get("sha256")
+    return value if isinstance(value, str) and value else None
+
+
+def scaffold_summary_current(summary: dict[str, Any], matrix_path: Path, plan_path: Path) -> bool:
+    return (
+        binding_sha(summary, "matrix") == source_binding(matrix_path, "test_matrix").get("sha256")
+        and binding_sha(summary, "plan") == source_binding(plan_path, "test_plan").get("sha256")
+    )
+
+
+def coverage_gaps(run_dir: Path, matrix: dict[str, Any], matrix_path: Path, plan_path: Path, warnings: list[dict[str, str]]) -> list[str]:
     summary, load_error = try_load_json(run_dir / "scaffold-summary.json")
     if not load_error:
         gaps = summary.get("coverage_gaps")
         if isinstance(gaps, list):
-            return [str(gap) for gap in gaps if str(gap).strip()]
+            if scaffold_summary_current(summary, matrix_path, plan_path):
+                return [str(gap) for gap in gaps if str(gap).strip()]
+            if any(str(gap).strip() for gap in gaps):
+                warnings.append({
+                    "name": "scaffold-summary",
+                    "path": str(run_dir / "scaffold-summary.json"),
+                    "warning": "stale_or_unbound_coverage_gaps_ignored",
+                })
     gaps: list[str] = []
     for test in as_list(matrix.get("tests")):
         if not isinstance(test, dict) or test.get("status") != "Blocked":
@@ -64,7 +84,7 @@ def coverage_gaps(run_dir: Path, matrix: dict[str, Any]) -> list[str]:
 
 
 def write_summary(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, payload)
 
 
 def main() -> int:
@@ -109,7 +129,7 @@ def main() -> int:
     requirements = [item for item in as_list(matrix.get("requirements")) if isinstance(item, dict)]
     tests = [item for item in as_list(matrix.get("tests")) if isinstance(item, dict)]
     steps = plan_steps(plan)
-    gaps = coverage_gaps(run_dir, matrix)
+    gaps = coverage_gaps(run_dir, matrix, matrix_path, plan_path, warnings)
 
     business_model = build_business_model(requirement_text or "", requirements, tests, gaps)
     oracle_model = build_oracle_model(requirements, tests)

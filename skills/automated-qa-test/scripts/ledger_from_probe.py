@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json
+from qa_core.contracts.schema import validate_artifact_schema
 
 ALLOWED_STATUSES = {"Passed", "Failed", "Blocked", "Untested", "Inconclusive"}
 
@@ -34,8 +36,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def as_list(value: Any) -> list[Any]:
@@ -185,6 +186,12 @@ def evidence_assertions(step: dict[str, Any]) -> list[str]:
         assertions.append(f"Unignored request failures observed: {step.get('checkedRequestFailures')}")
     if step.get("ignoredRequestFailures") is not None:
         assertions.append(f"Ignored request failures: {step.get('ignoredRequestFailures')}")
+    if step.get("checkedNoRequest") is not None:
+        target = step.get("checkedRequestTarget") or "<request>"
+        method = step.get("checkedRequestMethod") or ""
+        assertions.append(f"Forbidden request absent: {method} {target}".strip())
+    if step.get("ignoredRequests") is not None:
+        assertions.append(f"Ignored matching forbidden requests: {step.get('ignoredRequests')}")
     if step.get("checkedFailedResponses") is not None:
         assertions.append(f"Unignored failed HTTP responses observed: {step.get('checkedFailedResponses')}")
     if step.get("ignoredFailedResponses") is not None:
@@ -288,6 +295,11 @@ def make_evidence(step: dict[str, Any], evidence_id: str, base_dir: Path) -> dic
         ("ignoredConsoleErrors", "ignored_console_errors"),
         ("checkedRequestFailures", "checked_request_failures"),
         ("ignoredRequestFailures", "ignored_request_failures"),
+        ("checkedNoRequest", "checked_no_request"),
+        ("ignoredRequests", "ignored_requests"),
+        ("checkedRequestMethod", "checked_request_method"),
+        ("checkedRequestTarget", "checked_request_target"),
+        ("matchingRequests", "matching_requests"),
         ("checkedFailedResponses", "checked_failed_responses"),
         ("ignoredFailedResponses", "ignored_failed_responses"),
         ("stdoutPreview", "stdout_preview"),
@@ -374,6 +386,23 @@ def main() -> int:
         return 1
     assert matrix is not None
     assert results is not None
+    schema_errors = validate_artifact_schema("matrix", matrix) + validate_artifact_schema("results", results)
+    if schema_errors:
+        ledger = {
+            "schema_version": 2,
+            "generated_from": {"matrix": str(matrix_path), "results": str(results_path)},
+            "runtime_summary": {"probe_status": None, "input_artifact_error_count": len(schema_errors)},
+            "requirements": [],
+            "tests": [],
+            "evidence": [],
+            "input_artifact_errors": [
+                {"name": "schema_contract", "path": str(matrix_path.parent), "error": error}
+                for error in schema_errors
+            ],
+        }
+        write_json(out_path, ledger)
+        print(json.dumps(ledger, indent=2, ensure_ascii=False))
+        return 1
     base_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else Path(results.get("artifactDir") or out_path.parent).expanduser().resolve()
     steps = collect_steps(results)
 

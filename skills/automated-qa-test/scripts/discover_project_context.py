@@ -9,37 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from adapter_registry import detect_adapter_id, get_adapter_definition
+from qa_common import atomic_write_json
 
-OPC_SERVICES = [
-    {
-        "id": "one_corpus_web",
-        "role": "user-facing Vite app",
-        "path": "one_corpus_web",
-        "default_url": "http://127.0.0.1:9527",
-        "start_command": "npm run dev",
-    },
-    {
-        "id": "opc-bot",
-        "role": "Go Gin business API",
-        "path": "opc-bot",
-        "default_url": "http://127.0.0.1:8081",
-        "start_command": "go run ./cmd/bot-chat",
-    },
-    {
-        "id": "agent_platform",
-        "role": "FastAPI agent engine",
-        "path": "agent_platform",
-        "default_url": "http://127.0.0.1:8000",
-        "start_command": "python -m app.main",
-    },
-    {
-        "id": "ops_web",
-        "role": "operations console",
-        "path": "ops_web",
-        "default_url": "http://127.0.0.1:3070",
-        "start_command": "npm run dev",
-    },
-]
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"}
 
 
@@ -92,6 +64,13 @@ def read_package_summary(path: Path, root: Path) -> dict[str, Any]:
         "name": data.get("name"),
         "scripts": useful_scripts,
     }
+
+
+def generic_service_id(path: Path, root: Path, fallback: str) -> str:
+    relative = rel(path, root)
+    if relative in {"", "."}:
+        return fallback
+    return relative.replace("/", "-")
 
 
 def parse_url_port(url: str) -> int | None:
@@ -157,17 +136,14 @@ def service_status(service: dict[str, Any], root: Path, timeout: float, probe_ht
 
 
 def detect_adapter(root: Path) -> str:
-    opc_markers = ["one_corpus_web/package.json", "opc-bot/go.mod", "agent_platform/pyproject.toml"]
-    if all((root / marker).exists() for marker in opc_markers):
-        return "opc_project"
-    return "generic"
+    return detect_adapter_id(root)
 
 
 def generic_services(root: Path) -> list[dict[str, Any]]:
     services: list[dict[str, Any]] = []
     for package_path in [root / item for item in find_files(root, {"package.json"})]:
         services.append({
-            "id": rel(package_path.parent, root).replace("/", "-") or "node-app",
+            "id": generic_service_id(package_path.parent, root, "node-app"),
             "role": "Node/Vite/React app or package",
             "path": rel(package_path.parent, root),
             "default_url": "",
@@ -175,7 +151,7 @@ def generic_services(root: Path) -> list[dict[str, Any]]:
         })
     for go_mod in [root / item for item in find_files(root, {"go.mod"})]:
         services.append({
-            "id": rel(go_mod.parent, root).replace("/", "-") or "go-service",
+            "id": generic_service_id(go_mod.parent, root, "go-service"),
             "role": "Go service or module",
             "path": rel(go_mod.parent, root),
             "default_url": "",
@@ -183,7 +159,7 @@ def generic_services(root: Path) -> list[dict[str, Any]]:
         })
     for pyproject in [root / item for item in find_files(root, {"pyproject.toml"})]:
         services.append({
-            "id": rel(pyproject.parent, root).replace("/", "-") or "python-service",
+            "id": generic_service_id(pyproject.parent, root, "python-service"),
             "role": "Python service or package",
             "path": rel(pyproject.parent, root),
             "default_url": "",
@@ -268,7 +244,8 @@ def discover_context(
     package_files = [root / item for item in find_files(root, {"package.json"})]
     config_files = find_files(root, {"go.mod", "pyproject.toml", "config.yaml", "docker-compose.yml", "docker-compose.yaml"})
     env_files = find_env_files(root)
-    service_templates = OPC_SERVICES if adapter == "opc_project" else generic_services(root)
+    adapter_definition = get_adapter_definition(adapter)
+    service_templates = list((adapter_definition or {}).get("services", [])) if adapter_definition else generic_services(root)
     services: list[dict[str, Any]] = []
     for service in service_templates:
         if service.get("default_url"):
@@ -301,14 +278,7 @@ def discover_context(
         "Runtime secrets and endpoints must remain in env/config files.",
         "State whether this run uses local, test, staging, or production data before pass/fail.",
     ]
-    if adapter == "opc_project":
-        data_boundaries.extend([
-            "PostgreSQL owns user-editable platform data and chat/session state.",
-            "Elasticsearch owns knowledge metadata/chunks.",
-            "MinIO owns uploaded/generated files.",
-            "Redis is cache only.",
-            "one_corpus_web /api/v1/* normally proxies to opc-bot on 127.0.0.1:8081.",
-        ])
+    data_boundaries.extend(str(item) for item in (adapter_definition or {}).get("data_boundaries", []) if str(item))
 
     return {
         "schema_version": 1,
@@ -320,6 +290,7 @@ def discover_context(
             "readable": not input_errors,
         },
         "adapter": adapter,
+        "adapter_definition": (adapter_definition or {}).get("definition_path"),
         "base_url": base_url,
         "environment_boundary": {
             "runtime_mode": runtime_mode or "unconfirmed",
@@ -333,7 +304,7 @@ def discover_context(
             "package_summaries": package_summaries,
         },
         "services": services,
-        "evidence_layers": opc_evidence_layers() if adapter == "opc_project" else generic_evidence_layers(),
+        "evidence_layers": list((adapter_definition or {}).get("evidence_layers", [])) if adapter_definition else generic_evidence_layers(),
         "unsafe_shortcuts": [
             "Do not use UI text alone to prove backend/data completion.",
             "Do not treat seed data, fallback UI, stream terminal events, and persistence as one combined pass signal.",
@@ -375,8 +346,7 @@ def main() -> int:
     elif args.run_dir:
         out_path = Path(args.run_dir).expanduser() / "adapter-context.json"
     if out_path:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(context, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(out_path, context)
         print(out_path)
     else:
         print(json.dumps(context, indent=2, ensure_ascii=False))

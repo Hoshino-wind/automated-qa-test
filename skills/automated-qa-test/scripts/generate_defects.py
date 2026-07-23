@@ -6,6 +6,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json
+
 
 def try_load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not path.exists():
@@ -32,8 +34,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def as_list(value: Any) -> list[Any]:

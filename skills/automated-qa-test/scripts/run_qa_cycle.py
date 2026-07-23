@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from qa_common import atomic_write_json, is_within
+from qa_core.pipeline import CycleContext, CycleOptions, StageRunner, parse_cycle_options
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -29,7 +30,7 @@ def try_load_json(path: Path) -> tuple[dict[str, Any], str | None]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, value)
 
 
 def run_command(args: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -44,11 +45,6 @@ def run_command(args: list[str], cwd: Path | None = None) -> dict[str, Any]:
         "stdout": proc.stdout[-4000:],
         "stderr": proc.stderr[-4000:],
     }
-
-
-def add_step(summary: dict[str, Any], name: str, result: dict[str, Any]) -> None:
-    item = {"name": name, **result}
-    summary.setdefault("steps", []).append(item)
 
 
 def discover_results_path(stdout: str) -> Path | None:
@@ -95,27 +91,45 @@ def fail(summary: dict[str, Any], message: str, out_path: Path, *, status: str =
     return 1
 
 
-def clear_stale_terminal_outputs(summary: dict[str, Any], artifacts: list[tuple[str, Path]]) -> None:
+def clear_stale_terminal_outputs(summary: dict[str, Any], artifacts: list[tuple[str, Path]]) -> list[dict[str, str]]:
     cleared: list[dict[str, str]] = []
+    blocked: list[dict[str, str]] = []
     for name, path in artifacts:
         if not path.exists():
             continue
         artifact_kind = "directory" if path.is_dir() and not path.is_symlink() else "file"
         if artifact_kind == "directory":
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+            blocked.append({"name": name, "path": str(path), "kind": artifact_kind, "reason": "output_path_is_directory"})
+            continue
+        path.unlink()
         cleared.append({"name": name, "path": str(path), "kind": artifact_kind})
     if cleared:
         summary["cleared_stale_outputs"] = cleared
+    if blocked:
+        summary["blocked_output_paths"] = blocked
+    return blocked
+
+
+def external_output_paths(run_dir: Path, artifacts: list[tuple[str, Path]]) -> list[dict[str, str]]:
+    return [
+        {"name": name, "path": str(path), "reason": "output_path_outside_run_dir"}
+        for name, path in artifacts
+        if not is_within(path, run_dir)
+    ]
 
 
 def apply_environment_boundary_args(context_path: Path, runtime_mode: str | None, data_boundary_status: str | None) -> str | None:
-    if not (runtime_mode or data_boundary_status) or not context_path.exists():
+    if not (runtime_mode or data_boundary_status):
         return None
-    context, load_error = try_load_json(context_path)
-    if load_error:
-        return load_error
+    if context_path.exists():
+        context, load_error = try_load_json(context_path)
+        if load_error:
+            return load_error
+    else:
+        context = {
+            "schema_version": 1,
+            "adapter": "explicit_environment_boundary",
+        }
     boundary = context.setdefault("environment_boundary", {})
     if runtime_mode:
         boundary["runtime_mode"] = runtime_mode
@@ -215,6 +229,7 @@ def generate_verdict_handoff(
     cycle_error_path: Path,
     verdict_path: Path,
     require_environment_boundary: bool,
+    allow_missing_requirement_coverage: bool,
     current_artifacts: set[Path],
 ) -> None:
     verdict_cmd = [
@@ -258,8 +273,9 @@ def generate_verdict_handoff(
         summary.setdefault("omitted_stale_handoff_artifacts", []).extend(omitted_stale)
     if require_environment_boundary:
         verdict_cmd.append("--require-environment-boundary")
-    verdict_result = run_command(verdict_cmd, cwd=run_dir)
-    add_step(summary, "generate_verdict_handoff", verdict_result)
+    if allow_missing_requirement_coverage:
+        verdict_cmd.append("--allow-missing-requirement-coverage")
+    StageRunner(summary, run_command).run("generate_verdict_handoff", verdict_cmd, cwd=run_dir)
     summary.setdefault("paths", {})["verdict"] = str(verdict_path) if verdict_path.exists() else None
     if verdict_path.exists():
         current_artifacts.add(verdict_path.resolve())
@@ -270,165 +286,140 @@ def generate_verdict_handoff(
             summary["verdict"] = verdict
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a complete QA probe cycle: validate plan, execute probe, build ledger, audit evidence, and generate report.")
-    parser.add_argument("--run-dir", required=True, help="QA artifact directory containing test-plan.json and test-matrix.json")
-    parser.add_argument("--plan", help="Defaults to <run-dir>/test-plan.json")
-    parser.add_argument("--matrix", help="Defaults to <run-dir>/test-matrix.json")
-    parser.add_argument("--requirement", help="Defaults to <run-dir>/requirement.md when present")
-    parser.add_argument("--results", help="Defaults to <run-dir>/results.json")
-    parser.add_argument("--ledger", help="Defaults to <run-dir>/evidence-ledger.json")
-    parser.add_argument("--audit-summary", help="Defaults to <run-dir>/audit-summary.json")
-    parser.add_argument("--requirement-coverage", help="Defaults to <run-dir>/requirement-coverage.json")
-    parser.add_argument("--plan-audit-summary", help="Defaults to <run-dir>/plan-audit-summary.json")
-    parser.add_argument("--adapter-context", help="Defaults to <run-dir>/adapter-context.json when present")
-    parser.add_argument("--runtime-mode", help="Declared runtime mode to write into adapter-context.json, such as local, test, staging, production, or ci.")
-    parser.add_argument("--data-boundary-status", help="Declared data boundary to write into adapter-context.json.")
-    parser.add_argument("--adapter-probes", help="Defaults to <run-dir>/adapter-probes.json when present")
-    parser.add_argument("--service-preflight", help="Defaults to <run-dir>/service-preflight.json when present")
-    parser.add_argument("--service-runtime", help="Defaults to <run-dir>/service-runtime.json when service startup is used")
-    parser.add_argument("--defects", help="Defaults to <run-dir>/defects.json")
-    parser.add_argument("--next-probes", help="Defaults to <run-dir>/next-probes.json")
-    parser.add_argument("--next-probe-application", help="Defaults to <run-dir>/next-probe-application.json")
-    parser.add_argument("--business-model", help="Defaults to <run-dir>/business-model.json when present")
-    parser.add_argument("--oracle-model", help="Defaults to <run-dir>/oracle-model.json when present")
-    parser.add_argument("--qa-metrics", help="Defaults to <run-dir>/qa-metrics.json when present")
-    parser.add_argument("--closeout-candidates", help="Defaults to <run-dir>/closeout-candidates.json when present")
-    parser.add_argument("--semantic-artifacts-summary", help="Defaults to <run-dir>/semantic-artifacts-summary.json")
-    parser.add_argument("--cycle-error", help="Defaults to <run-dir>/qa-cycle-error.json")
-    parser.add_argument("--verdict", help="Defaults to <run-dir>/qa-verdict.json")
-    parser.add_argument("--report", help="Defaults to <run-dir>/report.md")
-    parser.add_argument("--summary", help="Defaults to <run-dir>/qa-run-summary.json")
-    parser.add_argument("--node-bin", default="node")
-    parser.add_argument("--strict-runtime", action="store_true")
-    parser.add_argument("--require-environment-boundary", action="store_true", help="Require adapter-context.json with confirmed runtime/data boundary before final pass can be claimed.")
-    parser.add_argument("--allow-unsafe-command", action="store_true")
-    parser.add_argument("--skip-requirement-coverage", action="store_true", help="Skip requirement.md to test-matrix.json source coverage audit.")
-    parser.add_argument("--allow-unmapped-requirement-source", action="store_true", help="Write requirement coverage warnings instead of failing for unmapped source units.")
-    parser.add_argument("--preflight-runtime", action="store_true", help="Check required services/tooling before validation and execution.")
-    parser.add_argument("--start-missing-services", action="store_true", help="Start missing required services from service-preflight.json start_plan after an initial preflight.")
-    parser.add_argument("--service-start-timeout", type=float, default=60.0, help="Seconds to wait for each started service port.")
-    parser.add_argument("--service-start-no-wait", action="store_true", help="Start missing services but do not wait for port readiness.")
-    parser.add_argument("--allow-preflight-blockers", action="store_true", help="Continue even when service-preflight.json contains blockers.")
-    parser.add_argument("--refresh-adapter-context", action="store_true", help="Re-probe adapter context during runtime preflight.")
-    parser.add_argument("--synthesize-adapter-probes", action="store_true", help="Apply adapter-aware probes before plan validation.")
-    parser.add_argument("--apply-next-probes", action="store_true", help="Apply existing safe next-probes.json recommendations before plan validation.")
-    parser.add_argument("--allow-live-stream", action="store_true", help="Forwarded to synthesize_adapter_probes.py when enabled.")
-    parser.add_argument("--allow-stopped-service", action="store_true", help="Forwarded to synthesize_adapter_probes.py when enabled.")
-    parser.add_argument("--agent-id", help="Forwarded to synthesize_adapter_probes.py.")
-    parser.add_argument("--user-id", help="Forwarded to synthesize_adapter_probes.py.")
-    parser.add_argument("--marker", help="Forwarded to synthesize_adapter_probes.py.")
-    parser.add_argument("--question", help="Forwarded to synthesize_adapter_probes.py.")
-    parser.add_argument("--ws-path", help="Forwarded to synthesize_adapter_probes.py.")
-    parser.add_argument("--session-detail-path", help="Forwarded to synthesize_adapter_probes.py.")
-    parser.add_argument("--persistence-command", help="Forwarded to synthesize_adapter_probes.py. Must be read-only.")
-    parser.add_argument("--allow-mutating-api-next-probes", action="store_true", help="Forwarded to apply_next_probes.py for explicitly safe test data only.")
-    parser.add_argument("--project-root", help="Forwarded to preflight_runtime.py.")
-    parser.add_argument("--required-service", action="append", help="Forwarded to preflight_runtime.py. May be repeated.")
-    parser.add_argument("--skip-probe", action="store_true", help="Use an existing results.json, or write an explicit skipped-results stub when it is missing.")
-    parser.add_argument("--skip-report", action="store_true")
-    args = parser.parse_args()
+class CycleRuntime:
+    """拥有单次 QA 周期的选项、路径与当前产物状态。"""
 
-    script_dir = Path(__file__).resolve().parent
-    run_dir = Path(args.run_dir).expanduser().resolve()
-    plan_path = Path(args.plan).expanduser().resolve() if args.plan else run_dir / "test-plan.json"
-    matrix_path = Path(args.matrix).expanduser().resolve() if args.matrix else run_dir / "test-matrix.json"
-    requirement_path = Path(args.requirement).expanduser().resolve() if args.requirement else run_dir / "requirement.md"
-    results_path = Path(args.results).expanduser().resolve() if args.results else run_dir / "results.json"
-    ledger_path = Path(args.ledger).expanduser().resolve() if args.ledger else run_dir / "evidence-ledger.json"
-    audit_summary_path = Path(args.audit_summary).expanduser().resolve() if args.audit_summary else run_dir / "audit-summary.json"
-    requirement_coverage_path = Path(args.requirement_coverage).expanduser().resolve() if args.requirement_coverage else run_dir / "requirement-coverage.json"
-    plan_audit_summary_path = Path(args.plan_audit_summary).expanduser().resolve() if args.plan_audit_summary else run_dir / "plan-audit-summary.json"
-    adapter_context_path = Path(args.adapter_context).expanduser().resolve() if args.adapter_context else run_dir / "adapter-context.json"
-    adapter_probes_path = Path(args.adapter_probes).expanduser().resolve() if args.adapter_probes else run_dir / "adapter-probes.json"
-    service_preflight_path = Path(args.service_preflight).expanduser().resolve() if args.service_preflight else run_dir / "service-preflight.json"
-    service_runtime_path = Path(args.service_runtime).expanduser().resolve() if args.service_runtime else run_dir / "service-runtime.json"
-    defects_path = Path(args.defects).expanduser().resolve() if args.defects else run_dir / "defects.json"
-    next_probes_path = Path(args.next_probes).expanduser().resolve() if args.next_probes else run_dir / "next-probes.json"
-    next_probe_application_path = Path(args.next_probe_application).expanduser().resolve() if args.next_probe_application else run_dir / "next-probe-application.json"
-    business_model_path = Path(args.business_model).expanduser().resolve() if args.business_model else run_dir / "business-model.json"
-    oracle_model_path = Path(args.oracle_model).expanduser().resolve() if args.oracle_model else run_dir / "oracle-model.json"
-    qa_metrics_path = Path(args.qa_metrics).expanduser().resolve() if args.qa_metrics else run_dir / "qa-metrics.json"
-    closeout_candidates_path = Path(args.closeout_candidates).expanduser().resolve() if args.closeout_candidates else run_dir / "closeout-candidates.json"
-    semantic_artifacts_summary_path = Path(args.semantic_artifacts_summary).expanduser().resolve() if args.semantic_artifacts_summary else run_dir / "semantic-artifacts-summary.json"
-    cycle_error_path = Path(args.cycle_error).expanduser().resolve() if args.cycle_error else run_dir / "qa-cycle-error.json"
-    verdict_path = Path(args.verdict).expanduser().resolve() if args.verdict else run_dir / "qa-verdict.json"
-    report_path = Path(args.report).expanduser().resolve() if args.report else run_dir / "report.md"
-    summary_path = Path(args.summary).expanduser().resolve() if args.summary else run_dir / "qa-run-summary.json"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, args: CycleOptions) -> None:
+        self.args = args
+        self.context = CycleContext.from_namespace(script_dir=Path(__file__).resolve().parent, args=args)
+        self.script_dir = self.context.script_dir
+        self.artifacts = self.context.artifacts
+        self.run_dir = self.artifacts.run_dir
+        self.plan_path = self.artifacts.plan
+        self.matrix_path = self.artifacts.matrix
+        self.requirement_path = self.artifacts.requirement
+        self.results_path = self.artifacts.results
+        self.ledger_path = self.artifacts.ledger
+        self.audit_summary_path = self.artifacts.audit_summary
+        self.requirement_coverage_path = self.artifacts.requirement_coverage
+        self.plan_audit_summary_path = self.artifacts.plan_audit_summary
+        self.adapter_context_path = self.artifacts.adapter_context
+        self.adapter_probes_path = self.artifacts.adapter_probes
+        self.service_preflight_path = self.artifacts.service_preflight
+        self.service_runtime_path = self.artifacts.service_runtime
+        self.defects_path = self.artifacts.defects
+        self.next_probes_path = self.artifacts.next_probes
+        self.next_probe_application_path = self.artifacts.next_probe_application
+        self.business_model_path = self.artifacts.business_model
+        self.oracle_model_path = self.artifacts.oracle_model
+        self.qa_metrics_path = self.artifacts.qa_metrics
+        self.closeout_candidates_path = self.artifacts.closeout_candidates
+        self.semantic_artifacts_summary_path = self.artifacts.semantic_artifacts_summary
+        self.cycle_error_path = self.artifacts.cycle_error
+        self.verdict_path = self.artifacts.verdict
+        self.report_path = self.artifacts.report
+        self.summary_path = self.artifacts.summary
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.summary = self.context.summary
+        self.stage_runner = StageRunner(self.summary, run_command)
+        self.current_artifacts = self.context.current_artifacts
 
-    summary: dict[str, Any] = {
-        "schema_version": 1,
-        "status": "running",
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-        "run_dir": str(run_dir),
-        "paths": {
-            "plan": str(plan_path),
-            "matrix": str(matrix_path),
-            "requirement": str(requirement_path) if requirement_path.exists() else None,
-            "results": str(results_path),
-            "ledger": str(ledger_path),
-            "requirement_coverage": str(requirement_coverage_path),
-            "defects": str(defects_path),
-            "next_probes": str(next_probes_path),
-            "next_probe_application": str(next_probe_application_path) if next_probe_application_path.exists() else None,
-            "business_model": str(business_model_path) if business_model_path.exists() else None,
-            "oracle_model": str(oracle_model_path) if oracle_model_path.exists() else None,
-            "qa_metrics": str(qa_metrics_path) if qa_metrics_path.exists() else None,
-            "closeout_candidates": str(closeout_candidates_path) if closeout_candidates_path.exists() else None,
-            "semantic_artifacts_summary": str(semantic_artifacts_summary_path) if semantic_artifacts_summary_path.exists() else None,
-            "cycle_error": str(cycle_error_path),
-            "verdict": str(verdict_path),
-            "adapter_context": str(adapter_context_path) if adapter_context_path.exists() else None,
-            "adapter_probes": str(adapter_probes_path) if adapter_probes_path.exists() else None,
-            "service_preflight": str(service_preflight_path) if service_preflight_path.exists() else None,
-            "service_runtime": str(service_runtime_path) if service_runtime_path.exists() else None,
-            "plan_audit_summary": str(plan_audit_summary_path),
-            "audit_summary": str(audit_summary_path),
-            "report": str(report_path) if not args.skip_report else None,
-        },
-        "steps": [],
-    }
-    clear_stale_terminal_outputs(summary, [("verdict", verdict_path), ("report", report_path), ("cycle_error", cycle_error_path)])
-    write_json(summary_path, summary)
-    current_artifacts: set[Path] = {summary_path.resolve()}
-
-    def fail_with_cycle_handoff(message: str, *, phase: str, result: dict[str, Any] | None = None, code: str = "cycle_helper_failed") -> int:
-        cycle_error = write_cycle_error(cycle_error_path, code=code, phase=phase, message=message, result=result)
-        summary["cycle_error"] = cycle_error
-        summary.setdefault("paths", {})["cycle_error"] = str(cycle_error_path)
-        current_artifacts.add(cycle_error_path.resolve())
-        generate_verdict_handoff(
-            summary,
-            script_dir=script_dir,
-            run_dir=run_dir,
-            ledger_path=ledger_path,
-            audit_summary_path=audit_summary_path,
-            results_path=results_path,
-            service_preflight_path=service_preflight_path,
-            service_runtime_path=service_runtime_path,
-            plan_audit_summary_path=plan_audit_summary_path,
-            defects_path=defects_path,
-            requirement_coverage_path=requirement_coverage_path,
-            adapter_context_path=adapter_context_path,
-            adapter_probes_path=adapter_probes_path,
-            cycle_error_path=cycle_error_path,
-            verdict_path=verdict_path,
-            require_environment_boundary=args.require_environment_boundary,
-            current_artifacts=current_artifacts,
+    def fail_with_cycle_handoff(
+        self,
+        message: str,
+        *,
+        phase: str,
+        result: dict[str, Any] | None = None,
+        code: str = "cycle_helper_failed",
+    ) -> int:
+        cycle_error = write_cycle_error(
+            self.cycle_error_path,
+            code=code,
+            phase=phase,
+            message=message,
+            result=result,
         )
-        if not summary.get("verdict"):
-            summary["verdict"] = write_minimal_error_verdict(
-                verdict_path,
-                cycle_error_path,
+        self.summary["cycle_error"] = cycle_error
+        self.summary.setdefault("paths", {})["cycle_error"] = str(self.cycle_error_path)
+        self.current_artifacts.add(self.cycle_error_path.resolve())
+        generate_verdict_handoff(
+            self.summary,
+            script_dir=self.script_dir,
+            run_dir=self.run_dir,
+            ledger_path=self.ledger_path,
+            audit_summary_path=self.audit_summary_path,
+            results_path=self.results_path,
+            service_preflight_path=self.service_preflight_path,
+            service_runtime_path=self.service_runtime_path,
+            plan_audit_summary_path=self.plan_audit_summary_path,
+            defects_path=self.defects_path,
+            requirement_coverage_path=self.requirement_coverage_path,
+            adapter_context_path=self.adapter_context_path,
+            adapter_probes_path=self.adapter_probes_path,
+            cycle_error_path=self.cycle_error_path,
+            verdict_path=self.verdict_path,
+            require_environment_boundary=self.args.require_environment_boundary,
+            allow_missing_requirement_coverage=self.args.allow_missing_requirement_coverage,
+            current_artifacts=self.current_artifacts,
+        )
+        if not self.summary.get("verdict"):
+            self.summary["verdict"] = write_minimal_error_verdict(
+                self.verdict_path,
+                self.cycle_error_path,
                 code=code,
                 phase=phase,
                 message=message,
             )
-            current_artifacts.add(verdict_path.resolve())
-        status = (summary.get("verdict") or {}).get("verdict") or "inconclusive"
-        return fail(summary, message, summary_path, status=status)
+            self.current_artifacts.add(self.verdict_path.resolve())
+        status = (self.summary.get("verdict") or {}).get("verdict") or "inconclusive"
+        return fail(self.summary, message, self.summary_path, status=status)
 
+
+def prepare_cycle(runtime: CycleRuntime) -> int | None:
+    """校验输出边界、环境上下文与必需输入。"""
+    args = runtime.args
+    context = runtime.context
+    artifacts = runtime.artifacts
+    run_dir = runtime.run_dir
+    plan_path = runtime.plan_path
+    matrix_path = runtime.matrix_path
+    adapter_context_path = runtime.adapter_context_path
+    summary_path = runtime.summary_path
+    summary = runtime.summary
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
+
+    output_artifacts = artifacts.named_outputs()
+    rejected_external = (
+        []
+        if args.allow_external_output_paths
+        else external_output_paths(run_dir, output_artifacts)
+    )
+    if rejected_external:
+        summary["blocked_output_paths"] = rejected_external
+        summary["status"] = "blocked"
+        summary["error"] = "Generated output paths must stay within --run-dir unless --allow-external-output-paths is explicit."
+        summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        fallback_summary_path = run_dir / "qa-run-summary.json"
+        write_json(fallback_summary_path, summary)
+        print(fallback_summary_path)
+        print(summary["error"], file=sys.stderr)
+        return 1
+    blocked_terminal_outputs = clear_stale_terminal_outputs(
+        summary,
+        artifacts.terminal_outputs(),
+    )
+    if blocked_terminal_outputs:
+        summary["status"] = "blocked"
+        summary["error"] = "A terminal output target is a directory; it was preserved and the cycle was blocked."
+        summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        write_json(summary_path, summary)
+        print(summary_path)
+        print(summary["error"], file=sys.stderr)
+        return 1
+    write_json(summary_path, summary)
+    context.mark_current(summary_path)
+    current_artifacts = context.current_artifacts
     if adapter_context_path.exists():
         _, adapter_context_load_error = try_load_json(adapter_context_path)
         if adapter_context_load_error:
@@ -446,7 +437,7 @@ def main() -> int:
         )
     if adapter_context_path.exists() and (args.runtime_mode or args.data_boundary_status):
         current_artifacts.add(adapter_context_path.resolve())
-
+        summary.setdefault("paths", {})["adapter_context"] = str(adapter_context_path)
     for required_path, label in ((plan_path, "test plan"), (matrix_path, "test matrix")):
         if not required_path.exists():
             return fail_with_cycle_handoff(
@@ -461,6 +452,33 @@ def main() -> int:
                 phase="required_artifacts",
                 code="invalid_required_qa_artifact",
             )
+    return None
+
+
+def run_requirement_coverage_stage(runtime: CycleRuntime) -> int | None:
+    """执行需求来源覆盖审计。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    matrix_path = runtime.matrix_path
+    requirement_path = runtime.requirement_path
+    results_path = runtime.results_path
+    ledger_path = runtime.ledger_path
+    audit_summary_path = runtime.audit_summary_path
+    requirement_coverage_path = runtime.requirement_coverage_path
+    plan_audit_summary_path = runtime.plan_audit_summary_path
+    adapter_context_path = runtime.adapter_context_path
+    adapter_probes_path = runtime.adapter_probes_path
+    service_preflight_path = runtime.service_preflight_path
+    service_runtime_path = runtime.service_runtime_path
+    defects_path = runtime.defects_path
+    cycle_error_path = runtime.cycle_error_path
+    verdict_path = runtime.verdict_path
+    summary_path = runtime.summary_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
 
     if requirement_path.exists() and not args.skip_requirement_coverage:
         coverage_cmd = [
@@ -475,8 +493,7 @@ def main() -> int:
         ]
         if args.allow_unmapped_requirement_source:
             coverage_cmd.append("--allow-unmapped-source")
-        coverage_result = run_command(coverage_cmd, cwd=run_dir)
-        add_step(summary, "audit_requirement_coverage", coverage_result)
+        coverage_result = stage_runner.run("audit_requirement_coverage", coverage_cmd, cwd=run_dir)
         if requirement_coverage_path.exists() or coverage_result["exit_code"] == 0:
             requirement_coverage, coverage_load_error = read_current_json_artifact(requirement_coverage_path, current_artifacts)
             if coverage_load_error:
@@ -505,13 +522,40 @@ def main() -> int:
                 cycle_error_path=cycle_error_path,
                 verdict_path=verdict_path,
                 require_environment_boundary=args.require_environment_boundary,
+                allow_missing_requirement_coverage=args.allow_missing_requirement_coverage,
                 current_artifacts=current_artifacts,
             )
             return fail(summary, "Requirement source coverage audit failed; map every requirement.md behavior point before executing probes.", summary_path, status="blocked")
     elif not requirement_path.exists():
-        add_step(summary, "audit_requirement_coverage", {"skipped": True, "reason": "requirement file is missing", "exit_code": 0})
+        stage_runner.skip("audit_requirement_coverage", "requirement file is missing")
     else:
-        add_step(summary, "audit_requirement_coverage", {"skipped": True, "reason": "--skip-requirement-coverage", "exit_code": 0})
+        stage_runner.skip("audit_requirement_coverage", "--skip-requirement-coverage")
+    return None
+
+
+def run_preflight_stage(runtime: CycleRuntime) -> int | None:
+    """执行运行时预检与受控服务启动。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    plan_path = runtime.plan_path
+    results_path = runtime.results_path
+    ledger_path = runtime.ledger_path
+    audit_summary_path = runtime.audit_summary_path
+    requirement_coverage_path = runtime.requirement_coverage_path
+    plan_audit_summary_path = runtime.plan_audit_summary_path
+    adapter_context_path = runtime.adapter_context_path
+    adapter_probes_path = runtime.adapter_probes_path
+    service_preflight_path = runtime.service_preflight_path
+    service_runtime_path = runtime.service_runtime_path
+    defects_path = runtime.defects_path
+    cycle_error_path = runtime.cycle_error_path
+    verdict_path = runtime.verdict_path
+    summary_path = runtime.summary_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
 
     def build_preflight_cmd(*, fail_on_blockers: bool, refresh_context: bool) -> list[str]:
         cmd = [
@@ -541,14 +585,12 @@ def main() -> int:
         for service_id in args.required_service or []:
             cmd.extend(["--required-service", service_id])
         return cmd
-
     if args.preflight_runtime:
         preflight_cmd = build_preflight_cmd(
             fail_on_blockers=not args.allow_preflight_blockers and not args.start_missing_services,
             refresh_context=args.refresh_adapter_context,
         )
-        preflight_result = run_command(preflight_cmd, cwd=run_dir)
-        add_step(summary, "preflight_runtime", preflight_result)
+        preflight_result = stage_runner.run("preflight_runtime", preflight_cmd, cwd=run_dir)
         summary["paths"]["service_preflight"] = str(service_preflight_path) if service_preflight_path.exists() else None
         if service_preflight_path.exists():
             current_artifacts.add(service_preflight_path.resolve())
@@ -570,6 +612,7 @@ def main() -> int:
                 cycle_error_path=cycle_error_path,
                 verdict_path=verdict_path,
                 require_environment_boundary=args.require_environment_boundary,
+                allow_missing_requirement_coverage=args.allow_missing_requirement_coverage,
                 current_artifacts=current_artifacts,
             )
             return fail(summary, "Runtime preflight found blockers; inspect service-preflight.json before executing probes.", summary_path, status="blocked")
@@ -597,8 +640,7 @@ def main() -> int:
             ]
             if args.service_start_no_wait:
                 runtime_cmd.append("--no-wait")
-            runtime_result = run_command(runtime_cmd, cwd=run_dir)
-            add_step(summary, "service_runtime_start", runtime_result)
+            runtime_result = stage_runner.run("service_runtime_start", runtime_cmd, cwd=run_dir)
             summary["paths"]["service_runtime"] = str(service_runtime_path) if service_runtime_path.exists() else None
             if runtime_result["exit_code"] != 0:
                 generate_verdict_handoff(
@@ -618,6 +660,7 @@ def main() -> int:
                     cycle_error_path=cycle_error_path,
                     verdict_path=verdict_path,
                     require_environment_boundary=args.require_environment_boundary,
+                    allow_missing_requirement_coverage=args.allow_missing_requirement_coverage,
                     current_artifacts=current_artifacts,
                 )
                 return fail(summary, "Service runtime startup failed; inspect service-runtime.json and service logs before executing probes.", summary_path, status="blocked")
@@ -633,8 +676,11 @@ def main() -> int:
                 fail_on_blockers=not args.allow_preflight_blockers,
                 refresh_context=True,
             )
-            preflight_after_start_result = run_command(preflight_after_start_cmd, cwd=run_dir)
-            add_step(summary, "preflight_runtime_after_start", preflight_after_start_result)
+            preflight_after_start_result = stage_runner.run(
+                "preflight_runtime_after_start",
+                preflight_after_start_cmd,
+                cwd=run_dir,
+            )
             summary["paths"]["service_preflight"] = str(service_preflight_path) if service_preflight_path.exists() else None
             if preflight_after_start_result["exit_code"] != 0:
                 generate_verdict_handoff(
@@ -654,6 +700,7 @@ def main() -> int:
                     cycle_error_path=cycle_error_path,
                     verdict_path=verdict_path,
                     require_environment_boundary=args.require_environment_boundary,
+                    allow_missing_requirement_coverage=args.allow_missing_requirement_coverage,
                     current_artifacts=current_artifacts,
                 )
                 return fail(summary, "Runtime preflight still has blockers after service startup; inspect service-preflight.json.", summary_path, status="blocked")
@@ -665,6 +712,26 @@ def main() -> int:
                     code="helper_output_unreadable",
                     result=preflight_after_start_result,
                 )
+    return None
+
+
+def run_adapter_stage(runtime: CycleRuntime) -> int | None:
+    """合成适配器探针并应用安全的下一探针。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    plan_path = runtime.plan_path
+    matrix_path = runtime.matrix_path
+    ledger_path = runtime.ledger_path
+    adapter_context_path = runtime.adapter_context_path
+    adapter_probes_path = runtime.adapter_probes_path
+    defects_path = runtime.defects_path
+    next_probes_path = runtime.next_probes_path
+    next_probe_application_path = runtime.next_probe_application_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
 
     if args.synthesize_adapter_probes:
         synth_cmd = [
@@ -699,8 +766,7 @@ def main() -> int:
         ):
             if value:
                 synth_cmd.extend([flag_name, value])
-        synth_result = run_command(synth_cmd, cwd=run_dir)
-        add_step(summary, "synthesize_adapter_probes", synth_result)
+        synth_result = stage_runner.run("synthesize_adapter_probes", synth_cmd, cwd=run_dir)
         summary["paths"]["adapter_probes"] = str(adapter_probes_path) if adapter_probes_path.exists() else None
         if synth_result["exit_code"] != 0:
             return fail_with_cycle_handoff("Adapter probe synthesis failed.", phase="synthesize_adapter_probes", result=synth_result)
@@ -712,10 +778,9 @@ def main() -> int:
                 code="helper_output_unreadable",
                 result=synth_result,
             )
-
     if args.apply_next_probes:
         if not next_probes_path.exists():
-            add_step(summary, "apply_next_probes", {"skipped": True, "exit_code": 0, "reason": f"Missing next-probes.json: {next_probes_path}"})
+            stage_runner.skip("apply_next_probes", f"Missing next-probes.json: {next_probes_path}")
         else:
             apply_next_cmd = [
                 sys.executable,
@@ -742,8 +807,7 @@ def main() -> int:
                 apply_next_cmd.append("--allow-command-probes")
             if args.allow_mutating_api_next_probes:
                 apply_next_cmd.append("--allow-mutating-api")
-            apply_next_result = run_command(apply_next_cmd, cwd=run_dir)
-            add_step(summary, "apply_next_probes", apply_next_result)
+            apply_next_result = stage_runner.run("apply_next_probes", apply_next_cmd, cwd=run_dir)
             summary["paths"]["next_probe_application"] = str(next_probe_application_path) if next_probe_application_path.exists() else None
             if apply_next_result["exit_code"] != 0:
                 return fail_with_cycle_handoff("Next-probe application failed.", phase="apply_next_probes", result=apply_next_result)
@@ -755,6 +819,39 @@ def main() -> int:
                     code="helper_output_unreadable",
                     result=apply_next_result,
                 )
+    return None
+
+
+def run_planning_stage(runtime: CycleRuntime) -> int | None:
+    """刷新语义产物并验证计划。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    plan_path = runtime.plan_path
+    matrix_path = runtime.matrix_path
+    requirement_path = runtime.requirement_path
+    results_path = runtime.results_path
+    ledger_path = runtime.ledger_path
+    audit_summary_path = runtime.audit_summary_path
+    requirement_coverage_path = runtime.requirement_coverage_path
+    plan_audit_summary_path = runtime.plan_audit_summary_path
+    adapter_context_path = runtime.adapter_context_path
+    adapter_probes_path = runtime.adapter_probes_path
+    service_preflight_path = runtime.service_preflight_path
+    service_runtime_path = runtime.service_runtime_path
+    defects_path = runtime.defects_path
+    business_model_path = runtime.business_model_path
+    oracle_model_path = runtime.oracle_model_path
+    qa_metrics_path = runtime.qa_metrics_path
+    closeout_candidates_path = runtime.closeout_candidates_path
+    semantic_artifacts_summary_path = runtime.semantic_artifacts_summary_path
+    cycle_error_path = runtime.cycle_error_path
+    verdict_path = runtime.verdict_path
+    summary_path = runtime.summary_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
 
     semantic_cmd = [
         sys.executable,
@@ -770,8 +867,7 @@ def main() -> int:
         "--out-summary",
         str(semantic_artifacts_summary_path),
     ]
-    semantic_result = run_command(semantic_cmd, cwd=run_dir)
-    add_step(summary, "refresh_semantic_artifacts", semantic_result)
+    semantic_result = stage_runner.run("refresh_semantic_artifacts", semantic_cmd, cwd=run_dir)
     summary["paths"]["business_model"] = str(business_model_path) if business_model_path.exists() else None
     summary["paths"]["oracle_model"] = str(oracle_model_path) if oracle_model_path.exists() else None
     summary["paths"]["qa_metrics"] = str(qa_metrics_path) if qa_metrics_path.exists() else None
@@ -782,7 +878,6 @@ def main() -> int:
     for semantic_path in (business_model_path, oracle_model_path, qa_metrics_path, closeout_candidates_path, semantic_artifacts_summary_path):
         if semantic_path.exists():
             current_artifacts.add(semantic_path.resolve())
-
     validate_cmd = [
         sys.executable,
         str(script_dir / "validate_plan.py"),
@@ -795,8 +890,9 @@ def main() -> int:
     ]
     if args.allow_unsafe_command:
         validate_cmd.append("--allow-unsafe-command")
-    validate_result = run_command(validate_cmd, cwd=run_dir)
-    add_step(summary, "validate_plan", validate_result)
+    if args.project_root:
+        validate_cmd.extend(["--project-root", args.project_root])
+    validate_result = stage_runner.run("validate_plan", validate_cmd, cwd=run_dir)
     if plan_audit_summary_path.exists() or validate_result["exit_code"] == 0:
         plan_audit_summary, plan_audit_load_error = read_current_json_artifact(plan_audit_summary_path, current_artifacts)
         if plan_audit_load_error:
@@ -824,9 +920,25 @@ def main() -> int:
             cycle_error_path=cycle_error_path,
             verdict_path=verdict_path,
             require_environment_boundary=args.require_environment_boundary,
+            allow_missing_requirement_coverage=args.allow_missing_requirement_coverage,
             current_artifacts=current_artifacts,
         )
         return fail(summary, "Plan validation failed; fix plan/matrix before executing probes.", summary_path, status="blocked")
+    return None
+
+
+def run_probe_stage(runtime: CycleRuntime) -> int | None:
+    """执行或复用探针结果。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    plan_path = runtime.plan_path
+    results_path = runtime.results_path
+    plan_audit_summary_path = runtime.plan_audit_summary_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
 
     if args.skip_probe:
         existing_results: dict[str, Any] = {}
@@ -840,12 +952,23 @@ def main() -> int:
                 )
         if not results_path.exists() or existing_results.get("status") == "skipped":
             write_json(results_path, make_skipped_results(plan_path, run_dir, "--skip-probe was set and no existing results.json was present."))
-        add_step(summary, "probe", {"skipped": True, "exit_code": 0, "results": str(results_path)})
+        stage_runner.record("probe", {"skipped": True, "exit_code": 0, "results": str(results_path)})
         if results_path.exists():
             current_artifacts.add(results_path.resolve())
     else:
-        probe_result = run_command([args.node_bin, str(script_dir / "playwright_probe.mjs"), "--plan", str(plan_path)], cwd=run_dir)
-        add_step(summary, "probe", probe_result)
+        probe_cwd = Path(args.project_root).expanduser().resolve() if args.project_root else run_dir
+        probe_result = stage_runner.run(
+            "probe",
+            [
+                args.node_bin,
+                str(script_dir / "playwright_probe.mjs"),
+                "--plan",
+                str(plan_path),
+                "--plan-audit-summary",
+                str(plan_audit_summary_path),
+            ],
+            cwd=probe_cwd,
+        )
         if probe_result["exit_code"] != 0:
             return fail_with_cycle_handoff("Probe runner failed before producing a usable result.", phase="probe", result=probe_result)
         if not results_path.exists():
@@ -863,8 +986,36 @@ def main() -> int:
                 code="helper_output_unreadable",
                 result=probe_result,
             )
+    runtime.results_path = results_path
+    return None
 
-    ledger_result = run_command(
+
+def run_evidence_stage(runtime: CycleRuntime) -> int | None:
+    """生成并严格审计证据账本。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    matrix_path = runtime.matrix_path
+    results_path = runtime.results_path
+    ledger_path = runtime.ledger_path
+    audit_summary_path = runtime.audit_summary_path
+    requirement_coverage_path = runtime.requirement_coverage_path
+    plan_audit_summary_path = runtime.plan_audit_summary_path
+    adapter_context_path = runtime.adapter_context_path
+    adapter_probes_path = runtime.adapter_probes_path
+    service_preflight_path = runtime.service_preflight_path
+    service_runtime_path = runtime.service_runtime_path
+    defects_path = runtime.defects_path
+    cycle_error_path = runtime.cycle_error_path
+    verdict_path = runtime.verdict_path
+    summary_path = runtime.summary_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
+
+    ledger_result = stage_runner.run(
+        "ledger_from_probe",
         [
             sys.executable,
             str(script_dir / "ledger_from_probe.py"),
@@ -877,7 +1028,6 @@ def main() -> int:
         ],
         cwd=run_dir,
     )
-    add_step(summary, "ledger_from_probe", ledger_result)
     if ledger_result["exit_code"] != 0:
         return fail_with_cycle_handoff("Ledger generation failed.", phase="ledger_from_probe", result=ledger_result)
     _, ledger_load_error = read_current_json_artifact(ledger_path, current_artifacts)
@@ -888,7 +1038,6 @@ def main() -> int:
             code="helper_output_unreadable",
             result=ledger_result,
         )
-
     audit_cmd = [
         sys.executable,
         str(script_dir / "audit_evidence.py"),
@@ -903,8 +1052,7 @@ def main() -> int:
     ]
     if args.strict_runtime:
         audit_cmd.append("--strict-runtime")
-    audit_result = run_command(audit_cmd, cwd=run_dir)
-    add_step(summary, "audit_evidence", audit_result)
+    audit_result = stage_runner.run("audit_evidence", audit_cmd, cwd=run_dir)
     if audit_summary_path.exists() or audit_result["exit_code"] == 0:
         audit_summary, audit_load_error = read_current_json_artifact(audit_summary_path, current_artifacts)
         if audit_load_error:
@@ -919,7 +1067,7 @@ def main() -> int:
         audit_summary = summary.get("audit") or {}
         if args.strict_runtime and is_runtime_disposition_only_audit_failure(audit_summary):
             summary["runtime_disposition_audit_failed"] = True
-            add_step(summary, "audit_runtime_disposition_handoff", {
+            stage_runner.record("audit_runtime_disposition_handoff", {
                 "exit_code": 0,
                 "reason": "Continuing after strict runtime disposition failure so defects, next probes, verdict, and report can be generated.",
             })
@@ -941,12 +1089,47 @@ def main() -> int:
                 cycle_error_path=cycle_error_path,
                 verdict_path=verdict_path,
                 require_environment_boundary=args.require_environment_boundary,
+                allow_missing_requirement_coverage=args.allow_missing_requirement_coverage,
                 current_artifacts=current_artifacts,
             )
             status = (summary.get("verdict") or {}).get("verdict") or "audit_failed"
             return fail(summary, "Evidence audit failed; inspect audit-summary.json before claiming pass.", summary_path, status=status)
+    return None
 
-    defects_result = run_command(
+
+def run_conclusion_stage(runtime: CycleRuntime) -> int | None:
+    """生成缺陷、下一探针、终局与报告。"""
+    args = runtime.args
+    script_dir = runtime.script_dir
+    run_dir = runtime.run_dir
+    plan_path = runtime.plan_path
+    matrix_path = runtime.matrix_path
+    requirement_path = runtime.requirement_path
+    results_path = runtime.results_path
+    ledger_path = runtime.ledger_path
+    audit_summary_path = runtime.audit_summary_path
+    requirement_coverage_path = runtime.requirement_coverage_path
+    plan_audit_summary_path = runtime.plan_audit_summary_path
+    adapter_context_path = runtime.adapter_context_path
+    adapter_probes_path = runtime.adapter_probes_path
+    service_preflight_path = runtime.service_preflight_path
+    service_runtime_path = runtime.service_runtime_path
+    defects_path = runtime.defects_path
+    next_probes_path = runtime.next_probes_path
+    next_probe_application_path = runtime.next_probe_application_path
+    business_model_path = runtime.business_model_path
+    oracle_model_path = runtime.oracle_model_path
+    qa_metrics_path = runtime.qa_metrics_path
+    closeout_candidates_path = runtime.closeout_candidates_path
+    verdict_path = runtime.verdict_path
+    report_path = runtime.report_path
+    summary = runtime.summary
+    stage_runner = runtime.stage_runner
+    current_artifacts = runtime.current_artifacts
+    fail_with_cycle_handoff = runtime.fail_with_cycle_handoff
+
+    defects_result = stage_runner.run(
+        "generate_defects",
         [
             sys.executable,
             str(script_dir / "generate_defects.py"),
@@ -961,7 +1144,6 @@ def main() -> int:
         ],
         cwd=run_dir,
     )
-    add_step(summary, "generate_defects", defects_result)
     if defects_result["exit_code"] != 0:
         return fail_with_cycle_handoff("Defect generation failed.", phase="generate_defects", result=defects_result)
     _, defects_load_error = read_current_json_artifact(defects_path, current_artifacts)
@@ -972,8 +1154,8 @@ def main() -> int:
             code="helper_output_unreadable",
             result=defects_result,
         )
-
-    next_probes_result = run_command(
+    next_probes_result = stage_runner.run(
+        "generate_next_probes",
         [
             sys.executable,
             str(script_dir / "generate_next_probes.py"),
@@ -988,7 +1170,6 @@ def main() -> int:
         ],
         cwd=run_dir,
     )
-    add_step(summary, "generate_next_probes", next_probes_result)
     if next_probes_result["exit_code"] != 0:
         return fail_with_cycle_handoff("Next-probe generation failed.", phase="generate_next_probes", result=next_probes_result)
     _, next_probes_load_error = read_current_json_artifact(next_probes_path, current_artifacts)
@@ -999,7 +1180,6 @@ def main() -> int:
             code="helper_output_unreadable",
             result=next_probes_result,
         )
-
     verdict_cmd = [
         sys.executable,
         str(script_dir / "generate_verdict.py"),
@@ -1028,8 +1208,9 @@ def main() -> int:
         verdict_cmd.extend(["--service-runtime", str(service_runtime_path)])
     if args.require_environment_boundary:
         verdict_cmd.append("--require-environment-boundary")
-    verdict_result = run_command(verdict_cmd, cwd=run_dir)
-    add_step(summary, "generate_verdict", verdict_result)
+    if args.allow_missing_requirement_coverage:
+        verdict_cmd.append("--allow-missing-requirement-coverage")
+    verdict_result = stage_runner.run("generate_verdict", verdict_cmd, cwd=run_dir)
     if verdict_result["exit_code"] != 0:
         return fail_with_cycle_handoff("Verdict generation failed.", phase="generate_verdict", result=verdict_result, code="verdict_generation_failed")
     verdict, verdict_load_error = read_current_json_artifact(verdict_path, current_artifacts)
@@ -1041,9 +1222,8 @@ def main() -> int:
             result=verdict_result,
         )
     summary["verdict"] = verdict
-
     if args.skip_report:
-        add_step(summary, "generate_report", {"skipped": True, "exit_code": 0})
+        stage_runner.skip("generate_report", "--skip-report")
     else:
         report_cmd = [
             sys.executable,
@@ -1087,10 +1267,16 @@ def main() -> int:
             report_cmd.extend(["--qa-metrics", str(qa_metrics_path)])
         if closeout_candidates_path.exists():
             report_cmd.extend(["--closeout-candidates", str(closeout_candidates_path)])
-        report_result = run_command(report_cmd, cwd=run_dir)
-        add_step(summary, "generate_report", report_result)
+        report_result = stage_runner.run("generate_report", report_cmd, cwd=run_dir)
         if report_result["exit_code"] != 0:
             return fail_with_cycle_handoff("Report generation failed.", phase="generate_report", result=report_result)
+    return None
+
+
+def finalize_cycle(runtime: CycleRuntime) -> int:
+    """写入最终摘要并返回周期状态。"""
+    summary_path = runtime.summary_path
+    summary = runtime.summary
 
     verdict = summary.get("verdict") or {}
     summary["status"] = verdict.get("verdict") or "attention"
@@ -1098,6 +1284,24 @@ def main() -> int:
     write_json(summary_path, summary)
     print(summary_path)
     return 0
+
+
+def main() -> int:
+    runtime = CycleRuntime(parse_cycle_options())
+    for stage in (
+        prepare_cycle,
+        run_requirement_coverage_stage,
+        run_preflight_stage,
+        run_adapter_stage,
+        run_planning_stage,
+        run_probe_stage,
+        run_evidence_stage,
+        run_conclusion_stage,
+    ):
+        outcome = stage(runtime)
+        if outcome is not None:
+            return outcome
+    return finalize_cycle(runtime)
 
 
 if __name__ == "__main__":

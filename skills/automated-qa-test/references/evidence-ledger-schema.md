@@ -1,6 +1,6 @@
 # Evidence Ledger Schema
 
-Use an evidence ledger whenever a QA/backtest run needs strict accuracy. The ledger is the only place where final requirement statuses should be recorded.
+Use an evidence ledger whenever a QA/backtest run needs strict accuracy. The ledger is the only place where final requirement statuses should be recorded. The supported major version is `schema_version: 2`; machine-readable schemas live under `references/schemas/`.
 
 ## Status Rules
 
@@ -144,11 +144,13 @@ Use `--strict-runtime` when console errors, failed requests, or request failures
 
 `audit-summary.json` records the audited ledger/matrix/results paths, their sha256 hashes, and sha256 hashes for referenced evidence artifact files. If `evidence-ledger.json`, `test-matrix.json`, `results.json`, or a referenced evidence artifact changes after the audit, rerun `scripts/audit_evidence.py` before generating `qa-verdict.json`; the final verdict blocks pass claims when the audit summary is unbound, stale, from another run, when matrix audit binding is missing, when evidence artifact hashes are missing or mismatched, when the audit-bound `results.json` is omitted, when `results.json.artifactDir` points outside the current run artifact directory, when `plan-audit-summary.json` fails validation, when `requirement-coverage.json` has unmapped source units, when `defects.json` contains findings or a summary/findings count mismatch, or when existing sibling `defects.json`, `requirement-coverage.json`, `plan-audit-summary.json`, `service-preflight.json`, `service-runtime.json`, `adapter-probes.json`, or `adapter-context.json` artifacts are left out of verdict generation or replaced by same-named artifacts from another run.
 
-For a run intended to support a real pass claim, generate the final verdict with `--require-environment-boundary` and a confirmed `adapter-context.json`. The verdict blocks `can_claim_pass=true` when:
+For a run intended to support a real pass claim, provide a confirmed `adapter-context.json`. Environment/data confirmation is required by default. The verdict blocks `can_claim_pass=true` when:
 
 - `adapter-context.json` is missing;
 - `environment_boundary.runtime_mode` is unconfirmed;
 - `environment_boundary.data_boundary_status` is unconfirmed.
+
+Passed evidence audited without `results.json` additionally requires `--manual-evidence-manifest`. The manifest must declare `schema_version: 1`, `mode: manual`, a non-empty operator/observation time/statement, and every passed evidence id. The final verdict must receive the same manifest and verifies its audit-bound path and SHA-256.
 
 The audit fails when:
 

@@ -1,130 +1,135 @@
-# 自动化 QA-Test
+# Automated QA-Test
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[中文文档](README.zh-CN.md) · [MIT License](LICENSE)
 
-[中文文档](README.zh-CN.md)
+A requirement-driven Codex skill for evidence-bound web, API, stream, persistence, and command QA. It compiles a requirement into executable probes, binds every `Passed` claim to current-run artifacts, and produces a fail-closed verdict and report.
 
-A Codex skill for strict, requirement-driven QA of web applications and APIs.
+## Requirements
 
-This skill helps Codex turn a requirement, issue, PR, or bug report into a test matrix, execute browser/API probes, maintain an evidence ledger, audit the evidence, and generate a report without fabricating data.
+- Python 3.12+
+- Node.js 20+
+- npm
+- Chrome or a Playwright-managed Chromium browser for browser probes
 
-## Skill Name
+Install the repository-owned runtime dependency:
 
-```text
-$automated-qa-test
+```bash
+npm ci
 ```
 
-## What It Does
+The runner no longer imports Playwright from a personal Codex skill directory. `package-lock.json` is the reproducible dependency source for local use and CI.
 
-- Extracts requirement points from user text, issues, PRs, or acceptance criteria.
-- Builds a dynamic test matrix instead of relying on hardcoded routes or stale page lists.
-- Runs Playwright-based browser/API probes through a reusable JSON plan.
-- Tracks requirement, test, and evidence mappings in `evidence-ledger.json`.
-- Fails audit checks when a requirement is marked `Passed` without evidence.
-- Forces unverified work into `Blocked`, `Untested`, or `Inconclusive` instead of guessing.
-
-## Install
-
-Copy the skill folder into your Codex skills directory:
+## Install The Skill
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R skills/automated-qa-test "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
-Restart Codex if the skill list does not refresh automatically.
+Invoke it as `$automated-qa-test` with a requirement, issue, PR, or bug report.
 
-Or install from this repository with your preferred Codex skill installer if available:
+## Canonical Workflow
 
-```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/install-skill-from-github.py" \
-  --repo Hoshino-wind/automated-qa-test \
-  --path skills/automated-qa-test
-```
-
-## Usage
-
-Ask Codex to use the skill with a requirement, issue, PR, or test scope:
-
-```text
-Use $automated-qa-test to strictly test this requirement. Do not fabricate data. Every Passed item must have evidence.
-```
-
-Example requirement:
-
-```text
-Use $automated-qa-test to test this issue end to end.
-Requirements:
-- The user can submit the form.
-- The API returns 200.
-- The created record appears in the list.
-- Do not fabricate data.
-- Mark anything without direct evidence as Untested, Blocked, or Inconclusive.
-```
-
-Typical workflow:
-
-1. Create a run artifact folder.
-2. Convert the requirement into `test-matrix.json`.
-3. Create or refine `test-plan.json`.
-4. Run the Playwright probe.
-5. Fill `evidence-ledger.json` from current-run evidence.
-6. Run the evidence audit.
-7. Generate the report.
-
-## Helper Scripts
-
-From the skill directory:
+Initialize a run with an explicit environment and data boundary:
 
 ```bash
-python3 scripts/init_qa_artifact.py \
-  --requirement-text "User can submit the form and see the saved item in the list." \
-  --base-url http://127.0.0.1:3000
+python3 skills/automated-qa-test/scripts/init_qa_artifact.py \
+  --requirement-file /path/to/requirement.md \
+  --base-url http://127.0.0.1:3000 \
+  --runtime-mode test \
+  --data-boundary-status "isolated test database; no production data"
+```
+
+Review the generated matrix and plan, then run the complete cycle:
+
+```bash
+python3 skills/automated-qa-test/scripts/run_qa_cycle.py \
+  --run-dir /path/to/run \
+  --preflight-runtime \
+  --strict-runtime
+```
+
+`run_qa_cycle.py` is the normal execution entry. It refreshes semantic artifacts, checks requirement coverage, validates and SHA-256-binds the plan, executes probes, builds and audits the ledger, generates defects/next probes, writes `qa-verdict.json`, and renders the report.
+
+Command steps cannot run through `playwright_probe.mjs` unless `--plan-audit-summary` points to a passed summary bound to the exact plan hash. Shell-string commands and `shell: true` are rejected by default; use array commands with shell execution disabled. `--allow-unsafe-command` can relax that ordinary shell boundary, but cannot override secret-file reads, exports, uploads, writes, or other secret mutations. Generated outputs stay under `--run-dir` by default, and directory-shaped output targets are preserved and rejected.
+
+## Fail-Closed Pass Rules
+
+`can_claim_pass=true` requires all of the following by default:
+
+- schema major version 2 for plan, matrix, results, and ledger;
+- mapped requirement-source coverage;
+- a passed, hash-bound plan audit;
+- current `results.json` bound through the evidence audit;
+- no unresolved runtime, setup, adapter, defect, or pipeline gaps;
+- a confirmed runtime mode and data boundary in `adapter-context.json`.
+
+The `--allow-unconfirmed-environment`, `--allow-unvalidated-plan`, and `--allow-missing-requirement-coverage` options are explicit exceptions for planning or partial runs. Their output must not be represented as a real-environment pass.
+
+For custom probes without `results.json`, provide a provenance manifest to both audit and verdict generation:
+
+```json
+{
+  "schema_version": 1,
+  "mode": "manual",
+  "operator": "qa-user",
+  "observed_at": "2026-07-22T12:00:00+08:00",
+  "statement": "Evidence was captured from the declared isolated test environment.",
+  "evidence_ids": ["E1", "E2"]
+}
 ```
 
 ```bash
-node scripts/playwright_probe.mjs --plan /path/to/run/test-plan.json
-```
-
-```bash
-python3 scripts/audit_evidence.py \
+python3 skills/automated-qa-test/scripts/audit_evidence.py \
   --matrix /path/to/run/test-matrix.json \
   --ledger /path/to/run/evidence-ledger.json \
+  --manual-evidence-manifest /path/to/run/manual-evidence-manifest.json \
   --summary /path/to/run/audit-summary.json
 ```
 
+Manual evidence mode is explicit and hash-bound; handwritten `current_run`, `assertions`, or `proves` fields alone cannot unlock a pass.
+
+## Project Adapters
+
+The core is project-agnostic. Optional project knowledge lives in `skills/automated-qa-test/references/adapters/*.json`. Adapter files own detection markers, services, env/config candidates, evidence layers, preflight routing, and probe defaults. No personal checkout path is embedded in the core scripts.
+
+## Architecture Boundaries
+
+`scripts/*.py` remain stable CLI compatibility entrypoints. `scripts/qa_core/contracts` owns artifact paths, runtime JSON Schema validation, evidence fields, and runner-binding rules. `scripts/qa_core/pipeline` owns `CycleOptions`, `CycleContext`, and the uniform stage execution/journaling boundary. `CycleRuntime` composes the requirement, preflight, adapter, planning, probe, evidence, and conclusion stages. Audit, verdict, report, and cycle orchestration consume these contracts instead of maintaining approximate copies.
+
+Scaffold internals follow the one-way `qa_scaffold/support → intents → modeling → rules → entry` dependency chain while the legacy `scaffold_requirement.py` module keeps its documented imports and CLI. Requirement classification is split into signal collection, conflict disambiguation, and three tag-projection families; requirement-specific evidence mapping plus foundation, resilience, authentication, integrity, advanced, UI-interaction, and runtime point rules use bounded private domain helpers behind their existing public functions. Regression fixtures place code-PR, source-coverage, and Agent-route contracts in dedicated support-only modules, then re-export their stable fixture entries through `contracts` or `agent`; build/release and secret-safety fixtures further dispatch to bounded private subscenario registries without changing the seven-family public fixture contract. `regression_check.py` owns only fixture registration, full-suite phase orchestration, and CLI handling. Architecture tests enforce dependency direction, bounded private family registries, and compatibility exports.
+
+CI runs Ruff `E`, `F`, and `I` checks before compilation and tests. Long requirement/fixture prose is intentionally exempt from `E501`, and test bootstrap modules may import after their explicit local `sys.path` setup; unused imports, dead locals, and import ordering remain blocking errors.
+
+## Main Artifacts
+
+The complete run includes the requirement, business/oracle models, charter, matrix, plan, environment context, preflight/runtime records, requirement and plan audits, results, evidence ledger, audit summary, defects, next probes, verdict, agent handoff, and report. Planning models and metrics are explicitly marked `not_evidence=true`; only current-run audited evidence can support a pass.
+
+Allowed statuses are `Passed`, `Failed`, `Blocked`, `Untested`, and `Inconclusive`.
+
+## Development Verification
+
+Fast safety and syntax checks:
+
 ```bash
-python3 scripts/generate_report.py \
-  --plan /path/to/run/test-plan.json \
-  --results /path/to/run/results.json \
-  --requirement /path/to/run/requirement.md \
-  --ledger /path/to/run/evidence-ledger.json \
-  --audit-summary /path/to/run/audit-summary.json \
-  --out /path/to/run/report.md
+npm test
+python3 -m compileall -q skills/automated-qa-test/scripts
 ```
 
-## Evidence Rules
+`npm test` includes the independent context-adversarial corpus in `references/modeling-adversarial-cases.json`. It checks static security terminology, 422 validation UX, revocation invariants, and browser scroll-state restoration separately from the in-file gold corpus.
 
-Allowed requirement statuses:
+Full maintenance regression:
 
-- `Passed`
-- `Failed`
-- `Blocked`
-- `Untested`
-- `Inconclusive`
+```bash
+npm run test:regression
+python3 skills/automated-qa-test/scripts/regression_check.py --with-browser
+```
 
-`Passed` requires direct current-run evidence. UI rendering alone does not prove data/API correctness when the requirement depends on data flow.
+During development, list or target isolated regression groups. Omitting `--group` preserves the complete non-browser regression:
 
-The audit fails when:
+```bash
+python3 skills/automated-qa-test/scripts/regression_check.py --list-groups
+python3 skills/automated-qa-test/scripts/regression_check.py --group contracts --group evidence
+```
 
-- a requirement has no mapped tests;
-- a matrix requirement or test is missing from the evidence ledger;
-- a `Passed` requirement has no evidence;
-- a `Passed` test has no evidence;
-- a requirement or test references missing evidence;
-- screenshot/file evidence points to a missing local file;
-- a non-passed item lacks explanatory notes.
-
-## License
-
-MIT
+CI runs the repository dependency install, compile check, safety suite, Node syntax check, and full non-browser regression.

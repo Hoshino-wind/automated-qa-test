@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
 import json
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json, file_sha256, manual_evidence_manifest_errors
+from qa_core.contracts.evidence import (
+    as_list,
+    boundary_field_confirmed,
+    collect_result_steps,
+    defect_finding_summary,
+    evidence_artifact_paths,
+    has_text,
+    nonnegative_int,
+    path_matches,
+    resolved_path,
+    runner_result_binding_missing,
+)
+from qa_core.contracts.schema import validate_artifact_schema
 
 STATUSES = ("Passed", "Failed", "Blocked", "Untested", "Inconclusive")
-UNCONFIRMED_BOUNDARY_VALUES = {
-    "",
-    "unconfirmed",
-    "unknown",
-    "unset",
-    "todo",
-    "tbd",
-    "must be stated before pass/fail",
-    "must be stated",
-}
-EVIDENCE_ARTIFACT_PATH_FIELDS = (
-    "path",
-    "file",
-    "body_path",
-    "response_body_path",
-    "request_body_path",
-    "messages_path",
-    "stdout_path",
-    "stderr_path",
-)
-
-
 def try_load_json(path: Path | None) -> tuple[dict[str, Any] | None, str | None]:
     if not path or not path.exists():
         return None, None
@@ -53,37 +44,7 @@ def load_json(path: Path | None) -> dict[str, Any] | None:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def file_sha256(path: Path) -> str | None:
-    if path.is_dir():
-        return None
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    return digest.hexdigest()
-
-
-def as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def has_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
-
-
-def id_set(value: Any) -> set[str]:
-    if isinstance(value, list):
-        items = value
-    else:
-        items = [value]
-    return {str(item).strip() for item in items if has_text(item)}
+    atomic_write_json(path, value)
 
 
 def ledger_status_counts(ledger: dict[str, Any] | None) -> dict[str, int]:
@@ -113,44 +74,6 @@ def runtime_issue_counts(results: dict[str, Any] | None) -> dict[str, int]:
         "failed_responses": failed_responses,
         "request_failures": request_failures,
         "total": console_errors + failed_responses + request_failures,
-    }
-
-
-def nonnegative_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int) and value >= 0:
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def defect_finding_summary(defects: dict[str, Any] | None) -> dict[str, Any]:
-    if not defects:
-        return {
-            "finding_count": 0,
-            "summary_count": None,
-            "findings_count": 0,
-            "invalid_summary_count": False,
-            "severity_counts": {},
-        }
-    summary = defects.get("summary") if isinstance(defects.get("summary"), dict) else {}
-    findings = as_list(defects.get("findings"))
-    summary_declared = "finding_count" in summary
-    summary_count = nonnegative_int(summary.get("finding_count")) if summary_declared else None
-    findings_count = len(findings)
-    effective_count = max(summary_count or 0, findings_count)
-    severity_counts = summary.get("severity_counts") if isinstance(summary.get("severity_counts"), dict) else {}
-    if findings and (not severity_counts or summary_count != findings_count):
-        counted = Counter(str(item.get("severity") or "unknown") for item in findings if isinstance(item, dict))
-        severity_counts = dict(sorted(counted.items()))
-    return {
-        "finding_count": effective_count,
-        "summary_count": summary_count,
-        "findings_count": findings_count,
-        "invalid_summary_count": summary_declared and summary_count is None,
-        "severity_counts": severity_counts,
     }
 
 
@@ -198,32 +121,8 @@ def runtime_disposition(ledger: dict[str, Any] | None, runtime_counts: dict[str,
     }
 
 
-def collect_result_steps(results: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not results:
-        return []
-    steps: list[dict[str, Any]] = []
-    for scenario in as_list(results.get("scenarios")):
-        if not isinstance(scenario, dict):
-            continue
-        for step in as_list(scenario.get("steps")):
-            if not isinstance(step, dict):
-                continue
-            merged = dict(step)
-            merged.setdefault("scenarioId", scenario.get("id", ""))
-            steps.append(merged)
-    return steps
 
 
-def result_step_lineage_match(evidence_item: dict[str, Any], step: dict[str, Any]) -> bool:
-    evidence_req_ids = id_set(evidence_item.get("requirement_ids"))
-    evidence_test_ids = id_set(evidence_item.get("test_ids"))
-    step_req_ids = id_set(step.get("requirementIds"))
-    step_test_ids = id_set(step.get("testIds"))
-    if evidence_req_ids and step_req_ids and not evidence_req_ids.intersection(step_req_ids):
-        return False
-    if evidence_test_ids and step_test_ids and not evidence_test_ids.intersection(step_test_ids):
-        return False
-    return True
 
 
 RUNNER_STEP_FIELD_MAP = (
@@ -260,6 +159,11 @@ RUNNER_STEP_FIELD_MAP = (
     ("ignored_console_errors", "ignoredConsoleErrors"),
     ("checked_request_failures", "checkedRequestFailures"),
     ("ignored_request_failures", "ignoredRequestFailures"),
+    ("checked_no_request", "checkedNoRequest"),
+    ("ignored_requests", "ignoredRequests"),
+    ("checked_request_method", "checkedRequestMethod"),
+    ("checked_request_target", "checkedRequestTarget"),
+    ("matching_requests", "matchingRequests"),
     ("checked_failed_responses", "checkedFailedResponses"),
     ("ignored_failed_responses", "ignoredFailedResponses"),
     ("stdout_preview", "stdoutPreview"),
@@ -289,80 +193,16 @@ RUNNER_STEP_PATH_FIELD_MAP = (
 )
 
 
-def resolve_artifact_path(base_dir: Path | None, value: str) -> Path:
-    path = Path(value).expanduser()
-    if path.is_absolute() or base_dir is None:
-        return path.resolve()
-    return (base_dir / path).resolve()
 
 
-def iter_path_values(value: Any):
-    if has_text(value):
-        yield str(value)
-    elif isinstance(value, dict):
-        for child in value.values():
-            yield from iter_path_values(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from iter_path_values(child)
 
 
-def evidence_artifact_paths(evidence: list[dict[str, Any]], base_dir: Path | None) -> list[Path]:
-    paths: list[Path] = []
-    seen: set[str] = set()
-    for item in evidence:
-        if not isinstance(item, dict):
-            continue
-        for field in EVIDENCE_ARTIFACT_PATH_FIELDS:
-            for raw in iter_path_values(item.get(field)):
-                resolved = resolve_artifact_path(base_dir, raw)
-                key = str(resolved)
-                if key in seen:
-                    continue
-                seen.add(key)
-                paths.append(resolved)
-    return paths
 
 
-def path_values_equal(base_dir: Path | None, evidence_value: Any, step_value: Any) -> bool:
-    if not has_text(evidence_value) or not has_text(step_value):
-        return evidence_value == step_value
-    return resolve_artifact_path(base_dir, str(evidence_value)) == resolve_artifact_path(base_dir, str(step_value))
 
 
-def runner_step_fields_match(evidence_item: dict[str, Any], step: dict[str, Any], base_dir: Path | None) -> bool:
-    for evidence_key, step_key in RUNNER_STEP_FIELD_MAP:
-        if step_key in step and step.get(step_key) is not None and evidence_key not in evidence_item:
-            return False
-        if evidence_key in evidence_item and (step_key not in step or evidence_item.get(evidence_key) != step.get(step_key)):
-            return False
-    for evidence_key, step_key in RUNNER_STEP_PATH_FIELD_MAP:
-        if has_text(step.get(step_key)) and evidence_key not in evidence_item:
-            return False
-        if evidence_key in evidence_item and (step_key not in step or not path_values_equal(base_dir, evidence_item.get(evidence_key), step.get(step_key))):
-            return False
-    return True
 
 
-def runner_result_binding_missing(evidence_item: dict[str, Any], result_steps: list[dict[str, Any]], base_dir: Path | None) -> bool:
-    scenario_id = str(evidence_item.get("scenario_id") or "").strip()
-    step_id = str(evidence_item.get("step_id") or "").strip()
-    action = str(evidence_item.get("action") or "").strip()
-    status = str(evidence_item.get("status") or "").strip()
-    candidates = [
-        step
-        for step in result_steps
-        if (not scenario_id or str(step.get("scenarioId") or "").strip() == scenario_id)
-        and (not step_id or str(step.get("stepId") or "").strip() == step_id)
-        and (not action or str(step.get("action") or "").strip() == action)
-        and result_step_lineage_match(evidence_item, step)
-    ]
-    if not candidates:
-        return True
-    status_candidates = [step for step in candidates if not status or str(step.get("status") or "").strip() == status]
-    if not status_candidates:
-        return True
-    return not any(runner_step_fields_match(evidence_item, step, base_dir) for step in status_candidates)
 
 
 def unbound_runner_evidence_ids(ledger: dict[str, Any] | None, results: dict[str, Any] | None, results_path: Path | None, limit: int = 12) -> list[str]:
@@ -379,13 +219,8 @@ def unbound_runner_evidence_ids(ledger: dict[str, Any] | None, results: dict[str
     return refs[:limit]
 
 
-def normalize_text(value: Any) -> str:
-    return str(value or "").strip().lower()
 
 
-def boundary_field_confirmed(value: Any) -> bool:
-    text = normalize_text(value)
-    return bool(text) and text not in UNCONFIRMED_BOUNDARY_VALUES
 
 
 def environment_boundary_issues(adapter_context: dict[str, Any] | None, *, required: bool) -> list[dict[str, Any]]:
@@ -435,22 +270,8 @@ def add_reason(reasons: list[dict[str, Any]], code: str, category: str, severity
     )
 
 
-def path_matches(recorded: Any, expected: Path | None) -> bool:
-    if not recorded or not expected:
-        return False
-    try:
-        return Path(str(recorded)).expanduser().resolve() == expected
-    except OSError:
-        return False
 
 
-def resolved_path(value: Any) -> Path | None:
-    if not value:
-        return None
-    try:
-        return Path(str(value)).expanduser().resolve()
-    except OSError:
-        return None
 
 
 def add_results_artifact_dir_reasons(
@@ -828,6 +649,17 @@ def strategy_gap_refs(plan_audit: dict[str, Any] | None, limit: int = 12) -> lis
     return refs[:limit]
 
 
+def strategy_coverage_sufficient(plan_audit: dict[str, Any] | None) -> bool | None:
+    if not plan_audit:
+        return None
+    if "coverage_sufficient" in plan_audit:
+        return bool(plan_audit.get("coverage_sufficient"))
+    coverage = plan_audit.get("strategy_coverage")
+    if not isinstance(coverage, dict):
+        return None
+    return int(coverage.get("gap_count") or 0) == 0
+
+
 def decide_verdict(reasons: list[dict[str, Any]]) -> str:
     severities = {item.get("severity") for item in reasons}
     codes = {item.get("code") for item in reasons}
@@ -846,6 +678,7 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
     ledger_path = Path(args.ledger).expanduser().resolve() if args.ledger else None
     audit_path = Path(args.audit_summary).expanduser().resolve() if args.audit_summary else None
     results_path = Path(args.results).expanduser().resolve() if args.results else None
+    manual_manifest_path = Path(args.manual_evidence_manifest).expanduser().resolve() if args.manual_evidence_manifest else None
     preflight_path = Path(args.service_preflight).expanduser().resolve() if args.service_preflight else None
     service_runtime_path = Path(args.service_runtime).expanduser().resolve() if args.service_runtime else None
     plan_audit_path = Path(args.plan_audit_summary).expanduser().resolve() if args.plan_audit_summary else None
@@ -859,6 +692,7 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
         "ledger": ledger_path,
         "audit_summary": audit_path,
         "results": results_path,
+        "manual_evidence_manifest": manual_manifest_path,
         "service_preflight": preflight_path,
         "service_runtime": service_runtime_path,
         "plan_audit_summary": plan_audit_path,
@@ -879,6 +713,7 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
     ledger = loaded_artifacts["ledger"]
     audit = loaded_artifacts["audit_summary"]
     results = loaded_artifacts["results"]
+    manual_manifest = loaded_artifacts["manual_evidence_manifest"]
     preflight = loaded_artifacts["service_preflight"]
     service_runtime = loaded_artifacts["service_runtime"]
     plan_audit = loaded_artifacts["plan_audit_summary"]
@@ -887,6 +722,16 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
     adapter_context = loaded_artifacts["adapter_context"]
     adapter_probes = loaded_artifacts["adapter_probes"]
     cycle_error = loaded_artifacts["cycle_error"]
+
+    for artifact_name, schema_name in (("ledger", "ledger"), ("results", "results")):
+        value = loaded_artifacts[artifact_name]
+        path = artifact_paths[artifact_name]
+        if value is None or path is None:
+            continue
+        input_artifact_errors.extend(
+            {"name": artifact_name, "path": str(path), "error": f"schema_contract: {error}"}
+            for error in validate_artifact_schema(schema_name, value)
+        )
 
     reasons: list[dict[str, Any]] = []
     counts = status_counts(ledger, audit)
@@ -905,6 +750,63 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
 
     if not ledger:
         add_reason(reasons, "missing_ledger", "artifact", "gap", "No evidence-ledger.json was provided; no final pass can be claimed.")
+    passed_evidence_ids = {
+        str(evidence_id)
+        for collection in (as_list((ledger or {}).get("requirements")), as_list((ledger or {}).get("tests")))
+        for item in collection
+        if isinstance(item, dict) and item.get("status") == "Passed"
+        for evidence_id in as_list(item.get("evidence_ids"))
+        if has_text(evidence_id)
+    }
+    if passed_evidence_ids and not results:
+        if not manual_manifest_path:
+            add_reason(
+                reasons,
+                "missing_runner_results",
+                "evidence_integrity",
+                "gap",
+                "Passed evidence has no results.json and no explicit manual evidence provenance manifest.",
+                ["results.json", "manual-evidence-manifest.json"],
+            )
+        else:
+            manifest_errors = manual_evidence_manifest_errors(manual_manifest, passed_evidence_ids)
+            if manifest_errors:
+                add_reason(
+                    reasons,
+                    "manual_evidence_provenance_invalid",
+                    "evidence_integrity",
+                    "gap",
+                    "; ".join(manifest_errors),
+                    [str(manual_manifest_path)],
+                )
+            audit_hashes = (audit or {}).get("artifact_hashes") if isinstance((audit or {}).get("artifact_hashes"), dict) else {}
+            if (audit or {}).get("evidence_mode") != "manual":
+                add_reason(
+                    reasons,
+                    "manual_evidence_not_audited",
+                    "evidence_integrity",
+                    "gap",
+                    "The audit summary does not declare an explicit manual evidence mode.",
+                    ["audit-summary.json"],
+                )
+            elif not path_matches((audit or {}).get("manual_evidence_manifest"), manual_manifest_path):
+                add_reason(
+                    reasons,
+                    "manual_evidence_manifest_path_mismatch",
+                    "evidence_integrity",
+                    "gap",
+                    "The manual evidence manifest differs from the one bound by audit-summary.json.",
+                    ["audit-summary.json", str(manual_manifest_path)],
+                )
+            elif audit_hashes.get("manual_evidence_manifest_sha256") != file_sha256(manual_manifest_path):
+                add_reason(
+                    reasons,
+                    "manual_evidence_manifest_hash_mismatch",
+                    "evidence_integrity",
+                    "gap",
+                    "The manual evidence manifest changed after the evidence audit.",
+                    ["audit-summary.json", str(manual_manifest_path)],
+                )
     add_sibling_artifact_reasons(
         reasons,
         ledger_path=ledger_path,
@@ -930,6 +832,25 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
             f"Evidence audit failed with {len(as_list(audit.get('errors')))} error(s).",
             ["audit-summary.json"],
         )
+    if counts.get("Passed"):
+        if not plan_audit and not args.allow_unvalidated_plan:
+            add_reason(
+                reasons,
+                "missing_plan_audit",
+                "plan_strategy",
+                "gap",
+                "No passed plan-audit-summary.json was provided; executable strategy was not validated.",
+                ["plan-audit-summary.json"],
+            )
+        if not requirement_coverage and not args.allow_missing_requirement_coverage:
+            add_reason(
+                reasons,
+                "missing_requirement_coverage",
+                "requirement_coverage",
+                "gap",
+                "No requirement-coverage.json was provided; source behavior coverage is unverified.",
+                ["requirement-coverage.json"],
+            )
     add_results_artifact_dir_reasons(reasons, results=results, results_path=results_path, ledger_path=ledger_path)
     add_artifact_binding_reasons(reasons, ledger=ledger, ledger_path=ledger_path, audit=audit, results_path=results_path)
     unbound_runner_refs = unbound_runner_evidence_ids(ledger, results, results_path)
@@ -1075,7 +996,8 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
     if blocked_adapter:
         add_reason(reasons, "adapter_probe_blocked", "adapter", "gap", f"{blocked_adapter} adapter probe layer(s) are blocked.", ["adapter-probes.json"])
 
-    for issue in environment_boundary_issues(adapter_context, required=args.require_environment_boundary):
+    require_environment_boundary = args.require_environment_boundary or not args.allow_unconfirmed_environment
+    for issue in environment_boundary_issues(adapter_context, required=require_environment_boundary):
         add_reason(reasons, issue["code"], "environment", "gap", issue["message"], issue.get("refs"))
 
     cycle_error_unreadable = any(issue.get("name") == "cycle_error" for issue in input_artifact_errors)
@@ -1108,6 +1030,7 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
             "preflight_runnable": None if not preflight else not bool(preflight.get("blockers")),
             "service_runtime_ready": None if not service_runtime else not any(reason.get("code", "").startswith("service_runtime") for reason in reasons),
             "plan_validated": None if not plan_audit else bool(plan_audit.get("passed")),
+            "strategy_coverage_sufficient": strategy_coverage_sufficient(plan_audit),
             "defect_free": finding_count == 0,
             "requirement_source_covered": None if not requirement_coverage else bool(requirement_coverage.get("passed")),
             "environment_boundary_confirmed": not any(reason.get("code") in {"missing_environment_boundary", "environment_unconfirmed", "data_boundary_unconfirmed"} for reason in reasons),
@@ -1118,6 +1041,7 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
             "ledger": str(ledger_path) if ledger_path else None,
             "audit_summary": str(audit_path) if audit_path else None,
             "results": str(results_path) if results_path else None,
+            "manual_evidence_manifest": str(manual_manifest_path) if manual_manifest_path else None,
             "service_preflight": str(preflight_path) if preflight_path else None,
             "service_runtime": str(service_runtime_path) if service_runtime_path else None,
             "plan_audit_summary": str(plan_audit_path) if plan_audit_path else None,
@@ -1136,6 +1060,7 @@ def main() -> int:
     parser.add_argument("--ledger")
     parser.add_argument("--audit-summary")
     parser.add_argument("--results")
+    parser.add_argument("--manual-evidence-manifest", help="Explicit provenance manifest for Passed evidence audited without results.json.")
     parser.add_argument("--service-preflight")
     parser.add_argument("--service-runtime")
     parser.add_argument("--plan-audit-summary")
@@ -1148,6 +1073,9 @@ def main() -> int:
     parser.add_argument("--require-preflight", action="store_true")
     parser.add_argument("--require-service-runtime", action="store_true")
     parser.add_argument("--require-environment-boundary", action="store_true", help="Require adapter-context.json plus confirmed runtime/data boundary before a pass can be claimed.")
+    parser.add_argument("--allow-unconfirmed-environment", action="store_true", help="Explicitly allow a non-pass-quality run without a confirmed environment/data boundary.")
+    parser.add_argument("--allow-unvalidated-plan", action="store_true", help="Explicitly allow verdict generation without plan-audit-summary.json.")
+    parser.add_argument("--allow-missing-requirement-coverage", action="store_true", help="Explicitly allow verdict generation without requirement-coverage.json.")
     parser.add_argument("--allow-partial-service-runtime", action="store_true")
     parser.add_argument("--fail-on-not-pass", action="store_true")
     args = parser.parse_args()

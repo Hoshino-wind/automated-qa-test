@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from discover_project_context import discover_context
-from scaffold_requirement import input_error_artifacts, scaffold, try_read_text, write_semantic_artifacts
+from qa_common import atomic_write_json, atomic_write_text
+from scaffold_artifacts import attach_scaffold_summary_bindings, try_read_text, write_semantic_artifacts
+from scaffold_requirement import input_error_artifacts, scaffold
 
 
 def slugify(text: str) -> str:
@@ -92,13 +93,13 @@ def main() -> int:
             runtime_mode=args.runtime_mode,
             data_boundary_status=args.data_boundary_status,
         )
-        (run_dir / "adapter-context.json").write_text(json.dumps(adapter_context, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(run_dir / "adapter-context.json", adapter_context)
         initialization_errors.extend(
             item for item in adapter_context.get("input_artifact_errors", [])
             if isinstance(item, dict)
         )
 
-    (run_dir / "requirement.md").write_text(requirement or "Requirement source was not provided.\n", encoding="utf-8")
+    atomic_write_text(run_dir / "requirement.md", requirement or "Requirement source was not provided.\n")
     if requirement_input_errors:
         artifacts = input_error_artifacts(args.base_url, run_dir, requirement_input_errors)
     else:
@@ -119,23 +120,24 @@ def main() -> int:
             for item in initialization_errors
             if isinstance(item, dict)
         )
-        (run_dir / "qa-initialization-error.json").write_text(json.dumps({
+        atomic_write_json(run_dir / "qa-initialization-error.json", {
             "schema_version": 1,
             "status": "blocked",
             "run_dir": str(run_dir),
             "input_artifact_errors": initialization_errors,
-        }, indent=2, ensure_ascii=False), encoding="utf-8")
+        })
     if adapter_context:
         artifacts["plan"].setdefault("metadata", {})["adapterContext"] = "adapter-context.json"
         artifacts["plan"]["metadata"]["adapter"] = adapter_context.get("adapter")
         artifacts["summary"]["adapter"] = adapter_context.get("adapter")
         artifacts["summary"]["adapter_context"] = "adapter-context.json"
-    (run_dir / "test-charter.md").write_text(artifacts["charter"], encoding="utf-8")
-    (run_dir / "test-plan.json").write_text(json.dumps(artifacts["plan"], indent=2, ensure_ascii=False), encoding="utf-8")
-    (run_dir / "test-matrix.json").write_text(json.dumps(artifacts["matrix"], indent=2, ensure_ascii=False), encoding="utf-8")
-    (run_dir / "scaffold-summary.json").write_text(json.dumps(artifacts["summary"], indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(run_dir / "test-charter.md", artifacts["charter"])
+    atomic_write_json(run_dir / "test-plan.json", artifacts["plan"])
+    atomic_write_json(run_dir / "test-matrix.json", artifacts["matrix"])
+    attach_scaffold_summary_bindings(run_dir, artifacts["summary"])
+    atomic_write_json(run_dir / "scaffold-summary.json", artifacts["summary"])
     write_semantic_artifacts(run_dir, artifacts)
-    (run_dir / "evidence-ledger.json").write_text(json.dumps(seed_ledger_from_matrix(artifacts["matrix"]), indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(run_dir / "evidence-ledger.json", seed_ledger_from_matrix(artifacts["matrix"]))
 
     print(run_dir)
     return 1 if initialization_errors else 0

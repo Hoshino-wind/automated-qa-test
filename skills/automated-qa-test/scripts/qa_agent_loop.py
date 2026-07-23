@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
 import json
 import shlex
 import shutil
@@ -11,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json, atomic_write_text, file_sha256
 
 SNAPSHOT_FILES = [
     "adapter-context.json",
@@ -169,18 +169,7 @@ def load_json(path: Path | None) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def file_sha256(path: Path) -> str | None:
-    if not path.exists() or path.is_dir():
-        return None
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    atomic_write_json(path, value)
 
 
 def next_probes_sha256(run_dir: Path) -> str | None:
@@ -963,7 +952,7 @@ def write_agent_handoff(summary_path: Path, summary: dict[str, Any]) -> Path:
             )
     lines.extend(["", f"_Generated at {datetime.now().isoformat(timespec='seconds')}._", ""])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines))
     return path
 
 

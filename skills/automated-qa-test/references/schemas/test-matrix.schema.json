@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openai.local/automated-qa-test/test-matrix.schema.json",
+  "title": "Automated QA Test Matrix v2",
+  "type": "object",
+  "required": ["schemaVersion", "requirements", "tests"],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "requirements": { "type": "array", "items": { "type": "object", "required": ["id", "test_ids"] } },
+    "tests": { "type": "array", "items": { "type": "object", "required": ["id", "requirement_ids"] } }
+  }
+}

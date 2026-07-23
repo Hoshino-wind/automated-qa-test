@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
 import json
 import re
 import struct
@@ -9,20 +8,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from qa_common import atomic_write_json, file_sha256, manual_evidence_manifest_errors, schema_version_error
+from qa_core.contracts.evidence import (
+    as_list,
+    collect_result_steps,
+    evidence_artifact_paths,
+    has_text,
+    id_set,
+    nonnegative_int,
+)
+from qa_core.contracts.evidence import (
+    runner_result_binding_error as contract_runner_result_binding_error,
+)
+from qa_core.contracts.schema import validate_artifact_schema
 
 ALLOWED_STATUSES = {"Passed", "Failed", "Blocked", "Untested", "Inconclusive"}
 PASSED = "Passed"
 FILE_EVIDENCE_TYPES = {"screenshot", "file", "log_file", "trace", "video", "command", "websocket", "api_response"}
-EVIDENCE_ARTIFACT_PATH_FIELDS = (
-    "path",
-    "file",
-    "body_path",
-    "response_body_path",
-    "request_body_path",
-    "messages_path",
-    "stdout_path",
-    "stderr_path",
-)
 NON_PASS_EVIDENCE_STATUSES = {"failed", "error", "skipped", "blocked", "untested", "inconclusive", "cancelled", "canceled", "timeout", "timed_out"}
 BUNDLED_LINEAGE_REQUIRED_GENERATORS = {"ledger_from_probe.py"}
 SECRET_PATTERNS = [
@@ -40,22 +42,20 @@ UI_TO_API_TEST_TYPES = {"ui_to_api", "click_to_response"}
 PERSISTENCE_TEST_TYPES = {"persistence", "database", "db"}
 PERSISTENCE_EVIDENCE_TYPES = {"command", "log_file", "api_response"}
 TERMINAL_STATUS_TEST_TYPES = STREAM_TEST_TYPES.union(API_TEST_TYPES, UI_TO_API_TEST_TYPES, PERSISTENCE_TEST_TYPES)
-RETURN_MARKER_REQUIRED_TERMS = (
-    "qa_marker",
-    "marker",
-    "unique marker",
-    "stale",
-    "not seed",
-    "not fallback",
-    "seed avoidance",
-    "fallback avoidance",
-    "without fallback",
-    "唯一",
-    "标记",
-    "非种子",
-    "不是种子",
-    "非降级",
-    "不是降级",
+RETURN_MARKER_REQUIRED_PATTERNS = (
+    re.compile(r"\bqa[_ -]?marker\b"),
+    re.compile(r"\bunique\s+marker\b"),
+    re.compile(r"\bcurrent[- ]?run\s+marker\b"),
+    re.compile(r"\buser\s+prompt\s+marker\b"),
+    re.compile(r"\breturned\s+marker\b"),
+    re.compile(r"\bround[- ]?trip(?:ped)?\s+marker\b"),
+    re.compile(r"\bmarker\s+(?:came back|returned|echoed|round[- ]?tripped|is present in (?:response|stream|stdout))\b"),
+    re.compile(r"\b(?:not|non|without|avoid(?:s|ed|ance)?|absence of)\s+(?:seed|fixture|fallback)(?:\s+(?:data|text|ui|response))?\b"),
+    re.compile(r"\b(?:stale|old|cached)\s+(?:seed|fixture|fallback)\b"),
+    re.compile(r"qa.*标记"),
+    re.compile(r"唯一.*标记"),
+    re.compile(r"标记.*返回"),
+    re.compile(r"(?:非|不是|避免|无).*(?:种子|降级)"),
 )
 TERMINAL_TERMS = ("answer_done", "terminal", "completed", "completion", "done", "完成", "终态")
 FRESHNESS_SKEW_SECONDS = 2.0
@@ -105,41 +105,11 @@ def load_json(path: Path) -> dict[str, Any]:
 def write_summary(path_arg: str | None, summary: dict[str, Any]) -> None:
     if path_arg:
         path = Path(path_arg).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        atomic_write_json(path, summary)
 
 
 def file_sha256_or_none(path: Path) -> str | None:
-    if path.is_dir():
-        return None
-    try:
-        return file_sha256(path)
-    except OSError:
-        return None
-
-
-def as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def id_set(value: Any) -> set[str]:
-    if isinstance(value, list):
-        items = value
-    else:
-        items = [value]
-    return {str(item).strip() for item in items if has_text(item)}
-
-
-def has_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+    return file_sha256(path)
 
 
 def iter_strings(value: Any, prefix: str = ""):
@@ -175,16 +145,6 @@ def passed_evidence_disposition_error(subject_kind: str, subject_id: Any, eviden
     if evidence_item.get("skipped") is True or status in NON_PASS_EVIDENCE_STATUSES:
         disposition = "skipped=true" if evidence_item.get("skipped") is True else f"status={evidence_item.get('status')!r}"
         return f"{subject_kind} {subject_id} is Passed but references non-pass evidence {evidence_id} ({disposition})."
-    return None
-
-
-def nonnegative_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int) and value >= 0:
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
     return None
 
 
@@ -228,154 +188,10 @@ def evidence_requires_lineage(item: dict[str, Any]) -> bool:
     return str(item.get("generated_by") or "").strip() in BUNDLED_LINEAGE_REQUIRED_GENERATORS
 
 
-def collect_result_steps(results: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not results:
-        return []
-    steps: list[dict[str, Any]] = []
-    for scenario in as_list(results.get("scenarios")):
-        if not isinstance(scenario, dict):
-            continue
-        for step in as_list(scenario.get("steps")):
-            if not isinstance(step, dict):
-                continue
-            merged = dict(step)
-            merged.setdefault("scenarioId", scenario.get("id", ""))
-            steps.append(merged)
-    return steps
-
-
-def result_step_lineage_match(evidence_item: dict[str, Any], step: dict[str, Any]) -> bool:
-    evidence_req_ids, evidence_test_ids = evidence_lineage(evidence_item)
-    step_req_ids = id_set(step.get("requirementIds"))
-    step_test_ids = id_set(step.get("testIds"))
-    if evidence_req_ids and step_req_ids and not evidence_req_ids.intersection(step_req_ids):
-        return False
-    if evidence_test_ids and step_test_ids and not evidence_test_ids.intersection(step_test_ids):
-        return False
-    return True
-
-
-RUNNER_STEP_FIELD_MAP = (
-    ("status_code", "statusCode"),
-    ("poll_attempt_count", "pollAttemptCount"),
-    ("poll_interval_ms", "pollIntervalMs"),
-    ("poll_timeout_ms", "pollTimeoutMs"),
-    ("poll_matched", "pollMatched"),
-    ("poll_attempts", "pollAttempts"),
-    ("expected_status_any", "expectedStatusAny"),
-    ("method", "method"),
-    ("observed_url", "url"),
-    ("response_headers", "responseHeaders"),
-    ("checked_response_headers", "checkedResponseHeaders"),
-    ("extracted_response_headers", "extractedResponseHeaders"),
-    ("extracted_response_header_names", "extractedResponseHeaderNames"),
-    ("request_body_captured", "requestBodyCaptured"),
-    ("request_body_preview", "requestBodyPreview"),
-    ("body_preview", "bodyPreview"),
-    ("request_text_contains_matched", "requestTextContainsMatched"),
-    ("request_text_not_contains_matched", "requestTextNotContainsMatched"),
-    ("response_text_contains_matched", "responseTextContainsMatched"),
-    ("response_text_not_contains_matched", "responseTextNotContainsMatched"),
-    ("checked_request_json", "checkedRequestJson"),
-    ("checked_json", "checkedJson"),
-    ("checked_json_alternative_index", "checkedJsonAlternativeIndex"),
-    ("checked_json_alternative", "checkedJsonAlternative"),
-    ("extracted_json", "extractedJson"),
-    ("extracted_json_paths", "extractedJsonPaths"),
-    ("messages_seen", "messageCount"),
-    ("message_text_contains_matched", "messageTextContainsMatched"),
-    ("exit_code", "exitCode"),
-    ("checked_console_errors", "checkedConsoleErrors"),
-    ("ignored_console_errors", "ignoredConsoleErrors"),
-    ("checked_request_failures", "checkedRequestFailures"),
-    ("ignored_request_failures", "ignoredRequestFailures"),
-    ("checked_failed_responses", "checkedFailedResponses"),
-    ("ignored_failed_responses", "ignoredFailedResponses"),
-    ("stdout_preview", "stdoutPreview"),
-    ("checked_stdout_json", "checkedStdoutJson"),
-    ("checked_stdout_json_alternative_index", "checkedStdoutJsonAlternativeIndex"),
-    ("checked_stdout_json_alternative", "checkedStdoutJsonAlternative"),
-    ("extracted_stdout_json", "extractedStdoutJson"),
-    ("extracted_stdout_json_paths", "extractedStdoutJsonPaths"),
-    ("stdout_contains_matched", "stdoutContainsMatched"),
-    ("stderr_preview", "stderrPreview"),
-    ("stderr_contains_matched", "stderrContainsMatched"),
-    ("hit_test", "hitTest"),
-    ("response_after_click", "responseAfterClick"),
-    ("page_url", "pageUrl"),
-    ("cleanup_attempted", "cleanupAttempted"),
-    ("skipped", "skipped"),
-    ("skip_reason", "skipReason"),
-    ("error", "error"),
-)
-
-RUNNER_STEP_PATH_FIELD_MAP = (
-    ("body_path", "bodyPath"),
-    ("request_body_path", "requestBodyPath"),
-    ("messages_path", "messagesPath"),
-    ("stdout_path", "stdoutPath"),
-    ("stderr_path", "stderrPath"),
-)
-
-
-def values_equal(left: Any, right: Any) -> bool:
-    return left == right
-
-
-def path_values_equal(base_dir: Path, evidence_value: Any, step_value: Any) -> bool:
-    if not has_text(evidence_value) or not has_text(step_value):
-        return evidence_value == step_value
-    return resolve_evidence_path(base_dir, str(evidence_value)).resolve() == resolve_evidence_path(base_dir, str(step_value)).resolve()
-
-
-def runner_step_field_mismatches(evidence_item: dict[str, Any], step: dict[str, Any], base_dir: Path) -> list[str]:
-    mismatches: list[str] = []
-    for evidence_key, step_key in RUNNER_STEP_FIELD_MAP:
-        if step_key not in step or step.get(step_key) is None:
-            continue
-        if evidence_key not in evidence_item:
-            mismatches.append(f"{evidence_key} is missing from ledger but results.{step_key} is present")
-        elif not values_equal(evidence_item.get(evidence_key), step.get(step_key)):
-            mismatches.append(f"{evidence_key}={evidence_item.get(evidence_key)!r} does not match results.{step_key}={step.get(step_key)!r}")
-    for evidence_key, step_key in RUNNER_STEP_PATH_FIELD_MAP:
-        if not has_text(step.get(step_key)):
-            continue
-        if evidence_key not in evidence_item:
-            mismatches.append(f"{evidence_key} is missing from ledger but results.{step_key} is present")
-        elif not path_values_equal(base_dir, evidence_item.get(evidence_key), step.get(step_key)):
-            mismatches.append(f"{evidence_key}={evidence_item.get(evidence_key)!r} does not match results.{step_key}={step.get(step_key)!r}")
-    return mismatches
-
-
 def runner_result_binding_error(evidence_item: dict[str, Any], result_steps: list[dict[str, Any]], base_dir: Path) -> str | None:
     if not evidence_requires_lineage(evidence_item):
         return None
-    evidence_id = str(evidence_item.get("id") or "unknown")
-    scenario_id = str(evidence_item.get("scenario_id") or "").strip()
-    step_id = str(evidence_item.get("step_id") or "").strip()
-    action = str(evidence_item.get("action") or "").strip()
-    status = str(evidence_item.get("status") or "").strip()
-    candidates = [
-        step
-        for step in result_steps
-        if (not scenario_id or str(step.get("scenarioId") or "").strip() == scenario_id)
-        and (not step_id or str(step.get("stepId") or "").strip() == step_id)
-        and (not action or str(step.get("action") or "").strip() == action)
-        and result_step_lineage_match(evidence_item, step)
-    ]
-    if not candidates:
-        return (
-            f"Runner-generated evidence {evidence_id} has no matching results.json step "
-            f"(scenario_id={scenario_id or '<empty>'}, step_id={step_id or '<empty>'}, action={action or '<empty>'})."
-        )
-    if status and not any(str(step.get("status") or "").strip() == status for step in candidates):
-        observed = sorted({str(step.get("status") or "<empty>") for step in candidates})
-        return f"Runner-generated evidence {evidence_id} status={status!r} does not match results.json step status(es) {observed}."
-    status_candidates = [step for step in candidates if not status or str(step.get("status") or "").strip() == status]
-    candidate_mismatches = [runner_step_field_mismatches(evidence_item, step, base_dir) for step in status_candidates]
-    if candidate_mismatches and not any(not mismatches for mismatches in candidate_mismatches):
-        return f"Runner-generated evidence {evidence_id} does not match bound results.json step fields: " + "; ".join(candidate_mismatches[0][:6]) + "."
-    return None
+    return contract_runner_result_binding_error(evidence_item, result_steps, base_dir)
 
 
 def requirement_lineage_findings(req: dict[str, Any], evidence_item: dict[str, Any]) -> tuple[list[str], list[str], bool]:
@@ -552,12 +368,22 @@ def has_return_marker_signal(evidence_items: list[dict[str, Any]], qa_marker: An
             or checked_return_json_has_marker(item, ("checked_json",), qa_marker)
         ):
             return True
-        if ev_type == "command" and (
+        command_like = (
+            ev_type == "command"
+            or str(item.get("action") or "").lower() == "command"
+            or item.get("checked_stdout_json") is not None
+            or has_text(item.get("stdout_path"))
+        )
+        if command_like and (
             matched_return_text_has_signal(item, ("stdout_contains_matched", "stderr_contains_matched"), qa_marker)
             or checked_return_json_has_marker(item, ("checked_stdout_json",), qa_marker)
         ):
             return True
     return False
+
+
+def claim_requires_return_marker(claim_text: str) -> bool:
+    return any(pattern.search(claim_text) for pattern in RETURN_MARKER_REQUIRED_PATTERNS)
 
 
 def has_terminal_signal(evidence_items: list[dict[str, Any]]) -> bool:
@@ -597,7 +423,7 @@ def evidence_layer_errors(test: dict[str, Any], evidence_items: list[dict[str, A
     if test_type in PERSISTENCE_TEST_TYPES and not has_evidence_type(evidence_items, PERSISTENCE_EVIDENCE_TYPES):
         errors.append(f"Test {test_id} is Passed as {test_type} but has no persistence/log/API evidence.")
 
-    if any(term in claim_text for term in RETURN_MARKER_REQUIRED_TERMS) and not has_return_marker_signal(evidence_items, qa_marker):
+    if claim_requires_return_marker(claim_text) and not has_return_marker_signal(evidence_items, qa_marker):
         errors.append(f"Test {test_id} is Passed with marker/stale-seed/fallback claims but lacks returned marker evidence.")
 
     if any(term in claim_text for term in TERMINAL_TERMS) and test_type in TERMINAL_STATUS_TEST_TYPES and not has_terminal_signal(evidence_items):
@@ -712,27 +538,6 @@ def unique_resolved_paths(base_dir: Path, raw_values: list[Any]) -> list[Path]:
         seen.add(key)
         paths.append(resolved)
     return paths
-
-
-def iter_path_values(value: Any):
-    if has_text(value):
-        yield str(value)
-    elif isinstance(value, dict):
-        for child in value.values():
-            yield from iter_path_values(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from iter_path_values(child)
-
-
-def evidence_artifact_paths(evidence: list[dict[str, Any]], base_dir: Path) -> list[Path]:
-    raw_values: list[Any] = []
-    for item in evidence:
-        if not isinstance(item, dict):
-            continue
-        for field in EVIDENCE_ARTIFACT_PATH_FIELDS:
-            raw_values.extend(iter_path_values(item.get(field)))
-    return unique_resolved_paths(base_dir, raw_values)
 
 
 def evidence_artifact_hashes(evidence: list[dict[str, Any]], base_dir: Path) -> dict[str, str]:
@@ -1074,11 +879,16 @@ def main() -> int:
     parser.add_argument("--base-dir", help="Base directory for relative evidence paths. Defaults to ledger directory.")
     parser.add_argument("--summary", help="Optional path to write audit-summary.json")
     parser.add_argument("--strict-runtime", action="store_true", help="Fail when probe runtime issues exist but all requirements are passed.")
+    parser.add_argument(
+        "--manual-evidence-manifest",
+        help="Explicit provenance manifest required when Passed evidence is audited without results.json.",
+    )
     args = parser.parse_args()
 
     ledger_path = Path(args.ledger).expanduser().resolve()
     matrix_path = Path(args.matrix).expanduser().resolve() if args.matrix else None
     results_path = Path(args.results).expanduser().resolve() if args.results else None
+    manual_manifest_path = Path(args.manual_evidence_manifest).expanduser().resolve() if args.manual_evidence_manifest else None
     base_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else ledger_path.parent
 
     input_artifact_errors: list[dict[str, str]] = []
@@ -1144,6 +954,11 @@ def main() -> int:
 
     errors: list[str] = []
     warnings: list[str] = []
+    errors.extend(validate_artifact_schema("ledger", ledger))
+    if matrix is not None:
+        errors.extend(validate_artifact_schema("matrix", matrix))
+    if results is not None:
+        errors.extend(validate_artifact_schema("results", results))
     screenshot_evidence_checked = 0
     text_artifact_assertions_checked = 0
     json_artifact_assertions_checked = 0
@@ -1153,6 +968,43 @@ def main() -> int:
     evidence_lineage_warning_count = 0
     runner_result_binding_checked = 0
     requirement_status_consistency_checked = 0
+
+    for document, field, artifact in (
+        (ledger, "schema_version", "ledger"),
+        (matrix, "schemaVersion", "matrix"),
+        (results, "schemaVersion", "results"),
+    ):
+        if document is None:
+            continue
+        version_error = schema_version_error(document.get(field), field=field, artifact=artifact)
+        if version_error:
+            errors.append(version_error)
+
+    passed_evidence_ids = {
+        str(evidence_id)
+        for item in requirements + tests
+        if isinstance(item, dict) and item.get("status") == PASSED
+        for evidence_id in as_list(item.get("evidence_ids"))
+        if has_text(evidence_id)
+    }
+    evidence_mode = "runner" if results else "none"
+    manual_manifest: dict[str, Any] | None = None
+    manual_manifest_hash: str | None = None
+    if passed_evidence_ids and not results:
+        if not manual_manifest_path:
+            errors.append(
+                "Passed evidence without results.json requires --manual-evidence-manifest with explicit provenance; default audit is fail-closed."
+            )
+        else:
+            manual_manifest, manual_manifest_error = try_load_json(manual_manifest_path)
+            if manual_manifest_error:
+                errors.append(f"Manual evidence manifest is unreadable: {manual_manifest_path} ({manual_manifest_error}).")
+            else:
+                manifest_errors = manual_evidence_manifest_errors(manual_manifest, passed_evidence_ids)
+                errors.extend(f"Manual evidence provenance invalid: {item}." for item in manifest_errors)
+                if not manifest_errors:
+                    evidence_mode = "manual"
+                    manual_manifest_hash = file_sha256_or_none(manual_manifest_path)
 
     for location, text in iter_strings(ledger):
         if any(pattern.search(text) for pattern in SECRET_PATTERNS):
@@ -1409,14 +1261,18 @@ def main() -> int:
             counts[status] += 1
 
     summary = {
+        "schema_version": 1,
         "ledger": str(ledger_path),
         "matrix": str(matrix_path) if matrix_path else None,
         "results": str(results_path) if results_path else None,
+        "evidence_mode": evidence_mode,
+        "manual_evidence_manifest": str(manual_manifest_path) if manual_manifest_path else None,
         "base_dir": str(base_dir),
         "artifact_hashes": {
             "ledger_sha256": file_sha256(ledger_path),
             "matrix_sha256": file_sha256(matrix_path) if matrix_path else None,
             "results_sha256": file_sha256(results_path) if results_path else None,
+            "manual_evidence_manifest_sha256": manual_manifest_hash,
             "evidence_artifacts_sha256": evidence_artifact_hashes(evidence, base_dir),
         },
         "requirement_count": total,
