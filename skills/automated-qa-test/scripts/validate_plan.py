@@ -10,6 +10,7 @@ from typing import Any
 
 from qa_common import atomic_write_json, file_sha256, schema_version_error
 from qa_core.contracts.schema import validate_artifact_schema
+from qa_core.tools import DEFAULT_EVIDENCE_ACTIONS, DEFAULT_TOOL_ACTIONS
 from qa_scaffold import command_secret_boundary_violation
 
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -20,39 +21,7 @@ PACKAGE_RUNNER_OPTIONS_WITH_VALUE = {
     "--package", "-p", "--registry", "--userconfig",
 }
 
-EVIDENCE_ACTIONS = {
-    "goto",
-    "setLocalStorage",
-    "addCookies",
-    "clickText",
-    "clickRole",
-    "click",
-    "clickAndWaitForResponse",
-    "fillLabel",
-    "fillPlaceholder",
-    "fill",
-    "press",
-    "waitForResponse",
-    "expectText",
-    "expectAnyText",
-    "expectVisible",
-    "expectClickable",
-    "expectHidden",
-    "expectLocatorCount",
-    "expectUrlContains",
-    "expectNoConsoleErrors",
-    "expectNoRequest",
-    "expectNoRequestFailures",
-    "expectNoFailedResponses",
-    "screenshot",
-    "api",
-    "pollApi",
-    "cleanupApi",
-    "websocket",
-    "sse",
-    "command",
-    "dismissIfPresent",
-}
+EVIDENCE_ACTIONS = DEFAULT_EVIDENCE_ACTIONS
 HTTP_REQUEST_ACTIONS = {"api", "pollApi", "cleanupApi", "clickAndWaitForResponse", "waitForResponse"}
 ALLOWED_NON_EXECUTED_STATUSES = {"Blocked", "Untested", "Inconclusive"}
 SECRET_PATTERNS = [
@@ -2443,6 +2412,13 @@ def main() -> int:
                 warnings.append(f"{location} references runtime template variable {var_name} at {var_location} before an earlier extractJson producer.")
         if not has_text(action):
             errors.append(f"{location} is missing action.")
+            continue
+        action = str(action)
+        if action not in DEFAULT_TOOL_ACTIONS:
+            errors.append(
+                f"{location} uses unsupported action {action!r}; "
+                "the default Tool Registry rejects it before runner execution."
+            )
             continue
         if sid:
             if sid in step_ids:

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import ast
+import contextlib
 import inspect
+import io
 import json
 import subprocess
 import sys
@@ -193,6 +195,25 @@ class ArchitectureContractTests(unittest.TestCase):
 
         self.assertTrue(strict.require_environment_boundary)
         self.assertFalse(explicitly_relaxed.require_environment_boundary)
+        self.assertEqual(strict.total_timeout_seconds, 1800.0)
+        self.assertEqual(strict.stage_timeout_seconds, 300.0)
+        self.assertEqual(strict.max_probes, 500)
+        self.assertEqual(strict.max_output_bytes, 16 * 1024 * 1024)
+
+    def test_cycle_options_reject_unbounded_or_invalid_runtime_limits(self) -> None:
+        for arguments in (
+            ["--total-timeout-seconds", "0"],
+            ["--stage-timeout-seconds", "nan"],
+            ["--max-probes", "0"],
+            ["--max-output-bytes", "-1"],
+            ["--termination-grace-seconds", "-0.1"],
+        ):
+            with self.subTest(arguments=arguments):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_cycle_options(
+                            ["--run-dir", "/tmp/qa", *arguments]
+                        )
 
     def test_stage_runner_owns_execution_and_summary_journaling(self) -> None:
         summary: dict[str, object] = {"steps": []}

@@ -53,6 +53,31 @@ python3 skills/automated-qa-test/scripts/run_qa_cycle.py \
 
 Command steps cannot run through `playwright_probe.mjs` unless `--plan-audit-summary` points to a passed summary bound to the exact plan hash. Shell-string commands and `shell: true` are rejected by default; use array commands with shell execution disabled. `--allow-unsafe-command` can relax that ordinary shell boundary, but cannot override secret-file reads, exports, uploads, writes, or other secret mutations. Generated outputs stay under `--run-dir` by default, and directory-shaped output targets are preserved and rejected.
 
+## Proof-Carrying Runtime
+
+Every cycle and outer Agent loop now has one wall-clock/probe/output budget and one logical writer. The cycle holds a generation-fenced filesystem lease, records a hash-chained event journal, commits current outputs into an immutable attempt, then publishes `Passed` only after a separate read-only proof verifier closes the state → manifest → attempt → current-input graph. A stale file, changed parent input, uncommitted verdict, old attempt, corrupt event, or competing writer therefore fails closed.
+
+The default limits are 1,800 seconds per run, 300 seconds per stage, 500 probes, 16 MiB of child output, and a 2-second TERM-to-KILL grace period. Override them explicitly with:
+
+```bash
+python3 skills/automated-qa-test/scripts/run_qa_cycle.py \
+  --run-dir /path/to/run \
+  --total-timeout-seconds 1800 \
+  --stage-timeout-seconds 300 \
+  --max-probes 500 \
+  --max-output-bytes 16777216 \
+  --termination-grace-seconds 2
+```
+
+`qa_agent_loop.py` applies those limits across all iterations; a new iteration does not reset probe or output usage. Verify a completed pass independently:
+
+```bash
+python3 skills/automated-qa-test/scripts/verify_run_proof.py \
+  --run-dir /path/to/run
+```
+
+`qa-run-summary.json` and reports remain projections. The authority chain is `run-events.jsonl`, `run-manifest.json`, the referenced immutable attempt, and the current hash-bound verdict.
+
 ## Fail-Closed Pass Rules
 
 `can_claim_pass=true` requires all of the following by default:
@@ -95,11 +120,13 @@ The core is project-agnostic. Optional project knowledge lives in `skills/automa
 
 ## Architecture Boundaries
 
-`scripts/*.py` remain stable CLI compatibility entrypoints. `scripts/qa_core/contracts` owns artifact paths, runtime JSON Schema validation, evidence fields, and runner-binding rules. `scripts/qa_core/pipeline` owns `CycleOptions`, `CycleContext`, and the uniform stage execution/journaling boundary. `CycleRuntime` composes the requirement, preflight, adapter, planning, probe, evidence, and conclusion stages. Audit, verdict, report, and cycle orchestration consume these contracts instead of maintaining approximate copies.
+`scripts/*.py` remain stable CLI compatibility entrypoints. `scripts/qa_core/contracts` owns artifact paths, runtime JSON Schema validation, evidence fields, and runner-binding rules. `scripts/qa_core/pipeline` owns `CycleOptions`, `CycleContext`, and the uniform stage execution/journaling boundary. `scripts/qa_core/runtime`, `state`, and `proof` own bounded process execution, leases, immutable attempts, event reduction, and proof verification. `scripts/qa_core/tools` and `agent` own strict ToolSpec, proposal, policy, and execution-authorization contracts; model output is a proposal, never an authorization. `CycleRuntime` composes the requirement, preflight, adapter, planning, probe, evidence, and conclusion stages.
 
 Scaffold internals follow the one-way `qa_scaffold/support → intents → modeling → rules → entry` dependency chain while the legacy `scaffold_requirement.py` module keeps its documented imports and CLI. Requirement classification is split into signal collection, conflict disambiguation, and three tag-projection families; requirement-specific evidence mapping plus foundation, resilience, authentication, integrity, advanced, UI-interaction, and runtime point rules use bounded private domain helpers behind their existing public functions. Regression fixtures place code-PR, source-coverage, and Agent-route contracts in dedicated support-only modules, then re-export their stable fixture entries through `contracts` or `agent`; build/release and secret-safety fixtures further dispatch to bounded private subscenario registries without changing the seven-family public fixture contract. `regression_check.py` owns only fixture registration, full-suite phase orchestration, and CLI handling. Architecture tests enforce dependency direction, bounded private family registries, and compatibility exports.
 
 CI runs Ruff `E`, `F`, and `I` checks before compilation and tests. Long requirement/fixture prose is intentionally exempt from `E501`, and test bootstrap modules may import after their explicit local `sys.path` setup; unused imports, dead locals, and import ordering remain blocking errors.
+
+The production-candidate architecture, invariants, SLOs, and held-out protocol are defined in [`CONTEXT.md`](CONTEXT.md) and [`docs/architecture/agent-v2.md`](docs/architecture/agent-v2.md). `agent_eval.py` is a strict evaluator-owned scorer, not proof that a production corpus has been run: production qualification still requires an independently frozen 200-scenario × 3-seed corpus and deterministic baseline.
 
 ## Main Artifacts
 

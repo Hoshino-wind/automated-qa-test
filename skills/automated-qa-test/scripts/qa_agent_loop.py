@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
+import os
 import shlex
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -11,6 +12,21 @@ from pathlib import Path
 from typing import Any
 
 from qa_common import atomic_write_json, atomic_write_text, file_sha256
+from qa_core.pipeline.options import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_PROBES,
+    DEFAULT_STAGE_TIMEOUT_SECONDS,
+    DEFAULT_TERMINATION_GRACE_SECONDS,
+    DEFAULT_TOTAL_TIMEOUT_SECONDS,
+)
+from qa_core.runtime.budget import (
+    BudgetExceeded,
+    BudgetReason,
+    RunBudget,
+)
+from qa_core.runtime.lease import LeaseAlreadyHeldError, RunLeaseError
+from qa_core.runtime.process import ProcessExecutor
+from qa_core.runtime.session import AGENT_OWNER_PREFIX, RunSession
 
 SNAPSHOT_FILES = [
     "adapter-context.json",
@@ -139,6 +155,10 @@ EVIDENCE_TYPE_LAYERS = {
     "video": "ui",
 }
 
+_ACTIVE_RUN_BUDGET: RunBudget | None = None
+_ACTIVE_TERMINATION_GRACE_SECONDS = DEFAULT_TERMINATION_GRACE_SECONDS
+_ACTIVE_RUN_SESSION: RunSession | None = None
+
 
 class InitializationError(RuntimeError):
     def __init__(self, message: str, *, result: dict[str, Any] | None = None, run_dir: Path | None = None) -> None:
@@ -187,6 +207,8 @@ def compact_json(value: Any, limit: int = 1200) -> str:
 
 
 def agent_handoff_path(summary_path: Path, summary: dict[str, Any]) -> Path:
+    if summary.get("stop_reason") == "agent_loop_writer_conflict":
+        return summary_path.with_name(f"{summary_path.stem}-handoff.md")
     run_dir = summary.get("run_dir")
     if run_dir:
         return Path(str(run_dir)).expanduser().resolve() / "qa-agent-handoff.md"
@@ -272,6 +294,34 @@ def write_agent_handoff(summary_path: Path, summary: dict[str, Any]) -> Path:
         )
         if analysis.get("operator_hint"):
             lines.append(f"- Operator hint: {analysis.get('operator_hint')}")
+    execution_boundary = (
+        summary.get("execution_boundary")
+        if isinstance(summary.get("execution_boundary"), dict)
+        else {}
+    )
+    if execution_boundary:
+        lines.extend(
+            [
+                "",
+                "## Execution Boundary",
+                "",
+                f"- Stage: `{execution_boundary.get('stage')}`",
+                (
+                    "- Termination reason: "
+                    f"`{execution_boundary.get('termination_reason')}`"
+                ),
+                f"- Exit code: `{execution_boundary.get('exit_code')}`",
+                (
+                    "- Raw exit code: "
+                    f"`{execution_boundary.get('raw_exit_code')}`"
+                ),
+                f"- Timed out: `{execution_boundary.get('timed_out')}`",
+                (
+                    "- Output bytes: "
+                    f"`{execution_boundary.get('output_bytes')}`"
+                ),
+            ]
+        )
     if next_action.get("requires_authorization") is not None:
         lines.append(f"- Requires authorization: `{next_action.get('requires_authorization')}`")
     if next_action.get("automatable_after_authorization") is not None:
@@ -957,20 +1007,185 @@ def write_agent_handoff(summary_path: Path, summary: dict[str, Any]) -> Path:
 
 
 def run_command(args: list[str], cwd: Path) -> dict[str, Any]:
+    """在当前循环预算内运行命令；保留两参数接口供回归替换。"""
+
+    budget = _ACTIVE_RUN_BUDGET or RunBudget(
+        total_timeout=DEFAULT_TOTAL_TIMEOUT_SECONDS,
+        default_stage_timeout=DEFAULT_STAGE_TIMEOUT_SECONDS,
+        max_probes=DEFAULT_MAX_PROBES,
+        max_output_bytes=DEFAULT_MAX_OUTPUT_BYTES,
+    )
     started_at_epoch = time.time()
-    started_at = datetime.now().isoformat(timespec="seconds")
-    proc = subprocess.run(args, cwd=str(cwd), text=True, capture_output=True)
+    stage = command_stage_name(args)
+    try:
+        result = ProcessExecutor(
+            budget,
+            stage,
+            termination_grace=_ACTIVE_TERMINATION_GRACE_SECONDS,
+        ).run(args, cwd=cwd)
+    except KeyboardInterrupt:
+        budget.cancel("QA agent loop interrupted by operator")
+        try:
+            budget.check()
+        except BudgetExceeded as exc:
+            result = budget_boundary_result(
+                args,
+                cwd,
+                stage,
+                exc,
+                started_at_epoch=started_at_epoch,
+                started=True,
+            )
+        else:
+            raise
+    result["started_at_epoch"] = started_at_epoch
+    result["finished_at_epoch"] = time.time()
+    return result
+
+
+def command_stage_name(command: list[str]) -> str:
+    """从数组命令提取稳定的阶段名。"""
+
+    for part in command:
+        path = Path(str(part))
+        if path.suffix == ".py":
+            return path.stem
+    if command:
+        return Path(str(command[0])).name or "command"
+    return "command"
+
+
+def budget_exit_code(reason: BudgetReason) -> int:
+    """把预算原因映射为稳定的非零进程退出码。"""
+
+    if reason in {
+        BudgetReason.DEADLINE_EXCEEDED,
+        BudgetReason.STAGE_TIMEOUT,
+    }:
+        return 124
+    if reason == BudgetReason.CANCELLED:
+        return 130
+    return 125
+
+
+def budget_boundary_result(
+    command: list[str],
+    cwd: Path,
+    stage: str,
+    error: BudgetExceeded,
+    *,
+    started_at_epoch: float,
+    started: bool,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """把循环侧预算异常投影为 ProcessExecutor 兼容结果。"""
+
+    prior = previous if isinstance(previous, dict) else {}
+    stdout = str(prior.get("stdout") or "")
+    stderr = str(prior.get("stderr") or "")
+    stdout_bytes = int(
+        prior.get("stdout_bytes")
+        if isinstance(prior.get("stdout_bytes"), int)
+        else len(stdout.encode("utf-8"))
+    )
+    stderr_bytes = int(
+        prior.get("stderr_bytes")
+        if isinstance(prior.get("stderr_bytes"), int)
+        else len(stderr.encode("utf-8"))
+    )
+    raw_exit_code = prior.get("raw_exit_code")
+    if raw_exit_code is None and "exit_code" in prior:
+        raw_exit_code = prior.get("exit_code")
+    finished_at_epoch = time.time()
+    started_at = prior.get("started_at")
+    if not isinstance(started_at, str):
+        started_at = datetime.fromtimestamp(started_at_epoch).astimezone().isoformat(
+            timespec="milliseconds"
+        )
     return {
-        "command": args,
+        "schema_version": 1,
+        "command": list(command),
         "cwd": str(cwd),
+        "stage": stage,
+        "started": started,
+        "exit_code": budget_exit_code(error.reason),
+        "raw_exit_code": raw_exit_code,
+        "timed_out": error.reason
+        in {
+            BudgetReason.DEADLINE_EXCEEDED,
+            BudgetReason.STAGE_TIMEOUT,
+        },
+        "termination_reason": error.reason.value,
+        "budget_error": error.to_dict(),
+        "stdout": stdout[-4000:],
+        "stderr": stderr[-4000:],
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "output_bytes": stdout_bytes + stderr_bytes,
+        "stdout_truncated": len(stdout.encode("utf-8")) > 4000,
+        "stderr_truncated": len(stderr.encode("utf-8")) > 4000,
+        "term_sent": bool(prior.get("term_sent")),
+        "kill_sent": bool(prior.get("kill_sent")),
+        "process_group_cleanup": False,
+        "spawn_error": prior.get("spawn_error"),
+        "executor_error": prior.get("executor_error"),
         "started_at": started_at,
+        "finished_at": datetime.now().astimezone().isoformat(
+            timespec="milliseconds"
+        ),
+        "duration_seconds": round(
+            max(0.0, finished_at_epoch - started_at_epoch),
+            6,
+        ),
         "started_at_epoch": started_at_epoch,
-        "finished_at": datetime.now().isoformat(timespec="seconds"),
-        "finished_at_epoch": time.time(),
-        "exit_code": proc.returncode,
-        "stdout": proc.stdout[-4000:],
-        "stderr": proc.stderr[-4000:],
+        "finished_at_epoch": finished_at_epoch,
     }
+
+
+def execute_loop_command(
+    command: list[str],
+    cwd: Path,
+    budget: RunBudget,
+    *,
+    stage: str,
+) -> dict[str, Any]:
+    """执行外层命令，并覆盖被 monkeypatch 的超时与输出计量缺口。"""
+
+    started_at_epoch = time.time()
+    try:
+        stage_budget = budget.stage(stage)
+    except BudgetExceeded as exc:
+        return budget_boundary_result(
+            command,
+            cwd,
+            stage,
+            exc,
+            started_at_epoch=started_at_epoch,
+            started=False,
+        )
+
+    result = run_command(command, cwd)
+    if result.get("termination_reason") or result.get("budget_error"):
+        return result
+    try:
+        if "output_bytes" not in result:
+            output_bytes = len(str(result.get("stdout") or "").encode("utf-8"))
+            output_bytes += len(
+                str(result.get("stderr") or "").encode("utf-8")
+            )
+            stage_budget.consume_output(output_bytes)
+        stage_budget.check()
+    except BudgetExceeded as exc:
+        return budget_boundary_result(
+            command,
+            cwd,
+            stage,
+            exc,
+            started_at_epoch=started_at_epoch,
+            started=bool(result.get("started", True)),
+            previous=result,
+        )
+    return result
 
 
 def last_output_path(result: dict[str, Any]) -> Path | None:
@@ -1018,6 +1233,48 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def positive_float_arg(value: str) -> float:
+    """解析 CLI 正浮点预算。"""
+
+    normalized = finite_float_arg(value)
+    if normalized <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return normalized
+
+
+def non_negative_float_arg(value: str) -> float:
+    """解析 CLI 非负浮点预算。"""
+
+    normalized = finite_float_arg(value)
+    if normalized < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return normalized
+
+
+def finite_float_arg(value: str) -> float:
+    """解析 CLI 有限浮点数。"""
+
+    try:
+        normalized = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be numeric") from exc
+    if not math.isfinite(normalized):
+        raise argparse.ArgumentTypeError("value must be finite")
+    return normalized
+
+
+def positive_int_arg(value: str) -> int:
+    """解析 CLI 正整数预算。"""
+
+    try:
+        normalized = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if normalized <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return normalized
 
 
 def parse_iso_epoch(value: Any) -> float | None:
@@ -3157,6 +3414,44 @@ def resume_loop_command(
         "--service-start-timeout",
         str(getattr(args, "service_start_timeout", 60.0)),
     ])
+    cmd.extend(
+        [
+            "--total-timeout-seconds",
+            str(
+                getattr(
+                    args,
+                    "total_timeout_seconds",
+                    DEFAULT_TOTAL_TIMEOUT_SECONDS,
+                )
+            ),
+            "--stage-timeout-seconds",
+            str(
+                getattr(
+                    args,
+                    "stage_timeout_seconds",
+                    DEFAULT_STAGE_TIMEOUT_SECONDS,
+                )
+            ),
+            "--max-probes",
+            str(getattr(args, "max_probes", DEFAULT_MAX_PROBES)),
+            "--max-output-bytes",
+            str(
+                getattr(
+                    args,
+                    "max_output_bytes",
+                    DEFAULT_MAX_OUTPUT_BYTES,
+                )
+            ),
+            "--termination-grace-seconds",
+            str(
+                getattr(
+                    args,
+                    "termination_grace_seconds",
+                    DEFAULT_TERMINATION_GRACE_SECONDS,
+                )
+            ),
+        ]
+    )
     for flag, enabled in (
         ("--strict-runtime", arg_bool(args, "strict_runtime")),
         ("--require-environment-boundary", arg_bool(args, "require_environment_boundary")),
@@ -3204,7 +3499,13 @@ def service_start_resume_command(args: argparse.Namespace, run_dir: Path) -> lis
     )
 
 
-def init_run_dir(args: argparse.Namespace, script_dir: Path, cwd: Path) -> tuple[Path, dict[str, Any] | None]:
+def init_run_dir(
+    args: argparse.Namespace,
+    script_dir: Path,
+    cwd: Path,
+    *,
+    budget: RunBudget | None = None,
+) -> tuple[Path, dict[str, Any] | None]:
     if args.run_dir:
         return Path(args.run_dir).expanduser().resolve(), None
     init_cmd = [
@@ -3228,7 +3529,16 @@ def init_run_dir(args: argparse.Namespace, script_dir: Path, cwd: Path) -> tuple
     bool_flag(init_cmd, "--allow-mutating-api", args.allow_mutating_api)
     bool_flag(init_cmd, "--skip-adapter-context", args.skip_adapter_context)
     bool_flag(init_cmd, "--no-http-probe", args.no_http_probe)
-    result = run_command(init_cmd, cwd=cwd)
+    result = (
+        execute_loop_command(
+            init_cmd,
+            cwd,
+            budget,
+            stage="initialize",
+        )
+        if budget is not None
+        else run_command(init_cmd, cwd=cwd)
+    )
     run_dir = last_output_path(result)
     if result["exit_code"] != 0:
         raise InitializationError("Initialization failed.", result=result, run_dir=run_dir)
@@ -3283,12 +3593,333 @@ def write_initialization_failure_summary(
             "failure_analysis": failure_analysis,
         },
     }
+    if execution_boundary_reason(error.result):
+        boundary = execution_boundary_projection(
+            error.result or {},
+            stage="initialize",
+            budget=None,
+        )
+        next_action = execution_boundary_action(boundary)
+        summary["stop_reason"] = "agent_loop_execution_boundary"
+        summary["execution_boundary"] = boundary
+        summary["final"] = execution_boundary_final(boundary)
+        summary["failure_analysis"] = next_action["failure_analysis"]
+        summary["next_action"] = next_action
+        if isinstance(boundary.get("budget"), dict):
+            summary["budget"] = boundary["budget"]
     summary["loop_control"] = build_loop_control(summary)
     write_agent_handoff(path, summary)
     write_json(path, summary)
 
 
-def build_cycle_cmd(args: argparse.Namespace, script_dir: Path, run_dir: Path, apply_next: bool) -> list[str]:
+def path_is_within(path: Path, directory: Path) -> bool:
+    """判断路径解析后是否位于给定目录内。"""
+
+    resolved_path = path.expanduser().resolve()
+    resolved_directory = directory.expanduser().resolve()
+    return (
+        resolved_path == resolved_directory
+        or resolved_directory in resolved_path.parents
+    )
+
+
+def writer_conflict_summary_path(
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> Path:
+    """为租约冲突选择 run 目录之外的安全摘要路径。"""
+
+    requested = (
+        Path(args.summary).expanduser().resolve()
+        if args.summary
+        else run_dir / "qa-agent-summary.json"
+    )
+    if not path_is_within(requested, run_dir):
+        return requested
+
+    base = Path(args.out_dir).expanduser().resolve()
+    if path_is_within(base, run_dir):
+        base = run_dir.parent.resolve()
+    if path_is_within(base, run_dir):
+        base = Path("/tmp").resolve()
+    filename = f"{run_dir.name or 'run'}-{os.getpid()}-qa-agent-summary.json"
+    return base / "qa-agent-conflicts" / filename
+
+
+def write_writer_conflict_summary(
+    args: argparse.Namespace,
+    run_dir: Path,
+    error: LeaseAlreadyHeldError,
+) -> Path:
+    """在冲突 run 之外写入确定性的非 PASS 交接。"""
+
+    path = writer_conflict_summary_path(args, run_dir)
+    now = datetime.now().isoformat(timespec="seconds")
+    reason_code = "agent_loop_writer_conflict"
+    failure_analysis = {
+        "category": reason_code,
+        "blocking_layer": "run_session",
+        "source": ".qa-run-lease.json",
+        "reason_codes": [reason_code],
+        "operator_hint": (
+            "Wait for the active outer QA agent loop to release its lease, "
+            "or coordinate with that owner before retrying."
+        ),
+        "confidence": "high",
+    }
+    current_lease = error.current.to_dict()
+    final = {
+        "verdict": "Inconclusive",
+        "can_claim_pass": False,
+        "reason_codes": [reason_code],
+        "failure_analysis": failure_analysis,
+    }
+    next_action = {
+        "action": "wait_for_active_agent_loop",
+        "automatable": False,
+        "reason": (
+            "Another outer QA agent loop owns the run directory; this "
+            "writer exited before changing run artifacts."
+        ),
+        "reason_codes": [reason_code],
+        "evidence": [str(path), str(path.with_name(f"{path.stem}-handoff.md"))],
+        "failure_analysis": failure_analysis,
+    }
+    summary: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "blocked",
+        "started_at": now,
+        "finished_at": now,
+        "run_dir": str(run_dir),
+        "max_iterations": args.max_iterations,
+        "planning_only": bool(args.skip_probe),
+        "iterations": [],
+        "stop_reason": reason_code,
+        "writer_conflict": {
+            "requested_owner_prefix": AGENT_OWNER_PREFIX,
+            "current_lease": current_lease,
+            "conflicted_run_dir": str(run_dir),
+            "summary_written_outside_run_dir": True,
+        },
+        "failure_analysis": failure_analysis,
+        "next_action": next_action,
+        "final": final,
+    }
+    summary["loop_control"] = build_loop_control(summary)
+    write_agent_handoff(path, summary)
+    write_json(path, summary)
+    return path
+
+
+def current_plan_probe_count(run_dir: Path) -> int:
+    """按内层周期的同一口径统计当前计划步骤。"""
+
+    plan = load_json(run_dir / "test-plan.json")
+    scenarios = plan.get("scenarios")
+    if not isinstance(scenarios, list):
+        return 0
+    return sum(
+        len(steps)
+        for scenario in scenarios
+        if isinstance(scenario, dict)
+        and isinstance((steps := scenario.get("steps")), list)
+    )
+
+
+def exhausted_budget_error(
+    budget: RunBudget,
+    reason: BudgetReason,
+    *,
+    stage: str,
+) -> BudgetExceeded:
+    """为零剩余额度生成稳定的结构化预算异常。"""
+
+    snapshot = budget.snapshot()
+    if reason == BudgetReason.PROBE_LIMIT:
+        limit = snapshot.max_probes
+        observed = snapshot.probes_used + 1
+    elif reason == BudgetReason.OUTPUT_BYTE_LIMIT:
+        limit = snapshot.max_output_bytes
+        observed = snapshot.output_bytes_used + 1
+    else:
+        limit = None
+        observed = None
+    return BudgetExceeded(
+        reason,
+        snapshot=snapshot,
+        stage=stage,
+        limit=limit,
+        observed=observed,
+        detail="No positive child allowance remains.",
+    )
+
+
+def reserve_cycle_resources(
+    run_dir: Path,
+    budget: RunBudget,
+) -> tuple[int, int, int]:
+    """预留当前计划，并返回计数、子周期 probe 与输出额度。"""
+
+    probe_count = current_plan_probe_count(run_dir)
+    stage_budget = budget.stage("qa_cycle")
+    before = budget.snapshot()
+    if before.max_probes is None:
+        probe_allowance = DEFAULT_MAX_PROBES
+    else:
+        probe_allowance = before.max_probes - before.probes_used
+    if probe_allowance <= 0:
+        raise exhausted_budget_error(
+            budget,
+            BudgetReason.PROBE_LIMIT,
+            stage="qa_cycle",
+        )
+    if (
+        before.max_output_bytes is not None
+        and before.output_bytes_used >= before.max_output_bytes
+    ):
+        raise exhausted_budget_error(
+            budget,
+            BudgetReason.OUTPUT_BYTE_LIMIT,
+            stage="qa_cycle",
+        )
+    stage_budget.consume_probe(probe_count)
+    snapshot = budget.snapshot()
+    if snapshot.max_output_bytes is None:
+        output_allowance = DEFAULT_MAX_OUTPUT_BYTES
+    else:
+        output_allowance = (
+            snapshot.max_output_bytes - snapshot.output_bytes_used
+        )
+    if output_allowance <= 0:
+        raise exhausted_budget_error(
+            budget,
+            BudgetReason.OUTPUT_BYTE_LIMIT,
+            stage="qa_cycle",
+        )
+    return probe_count, probe_allowance, output_allowance
+
+
+def reconcile_cycle_probe_reservation(
+    run_dir: Path,
+    budget: RunBudget,
+    *,
+    reserved_probe_count: int,
+    command: list[str],
+    result: dict[str, Any],
+    started_at_epoch: float,
+) -> dict[str, Any]:
+    """为子周期应用后新增的计划步骤补记总 probe 额度。"""
+
+    current_count = current_plan_probe_count(run_dir)
+    additional_count = max(0, current_count - reserved_probe_count)
+    if additional_count <= 0:
+        return result
+    try:
+        budget.stage("qa_cycle").consume_probe(additional_count)
+    except BudgetExceeded as exc:
+        return budget_boundary_result(
+            command,
+            run_dir,
+            "qa_cycle",
+            exc,
+            started_at_epoch=started_at_epoch,
+            started=bool(result.get("started", True)),
+            previous=result,
+        )
+    return result
+
+
+def cycle_budget_values(
+    args: argparse.Namespace,
+    budget: RunBudget | None,
+    *,
+    max_probes_override: int | None = None,
+    max_output_bytes_override: int | None = None,
+) -> tuple[float, float, int, int, float]:
+    """计算下游周期可使用的剩余或显式预算。"""
+
+    total_timeout = float(
+        getattr(
+            args,
+            "total_timeout_seconds",
+            DEFAULT_TOTAL_TIMEOUT_SECONDS,
+        )
+    )
+    if budget is not None:
+        budget.check()
+        remaining = budget.remaining_time()
+        if remaining is not None and remaining > 0:
+            total_timeout = min(total_timeout, remaining)
+    stage_timeout = min(
+        float(
+            getattr(
+                args,
+                "stage_timeout_seconds",
+                DEFAULT_STAGE_TIMEOUT_SECONDS,
+            )
+        ),
+        total_timeout,
+    )
+    snapshot = budget.snapshot() if budget is not None else None
+    if max_probes_override is not None:
+        max_probes = max_probes_override
+    elif snapshot is not None and snapshot.max_probes is not None:
+        max_probes = snapshot.max_probes - snapshot.probes_used
+        if max_probes <= 0:
+            raise exhausted_budget_error(
+                budget,
+                BudgetReason.PROBE_LIMIT,
+                stage="qa_cycle",
+            )
+    else:
+        max_probes = int(
+            getattr(args, "max_probes", DEFAULT_MAX_PROBES)
+        )
+    if max_output_bytes_override is not None:
+        max_output_bytes = max_output_bytes_override
+    elif snapshot is not None and snapshot.max_output_bytes is not None:
+        max_output_bytes = (
+            snapshot.max_output_bytes - snapshot.output_bytes_used
+        )
+        if max_output_bytes <= 0:
+            raise exhausted_budget_error(
+                budget,
+                BudgetReason.OUTPUT_BYTE_LIMIT,
+                stage="qa_cycle",
+            )
+    else:
+        max_output_bytes = int(
+            getattr(
+                args,
+                "max_output_bytes",
+                DEFAULT_MAX_OUTPUT_BYTES,
+            )
+        )
+    return (
+        total_timeout,
+        stage_timeout,
+        max_probes,
+        max_output_bytes,
+        float(
+            getattr(
+                args,
+                "termination_grace_seconds",
+                DEFAULT_TERMINATION_GRACE_SECONDS,
+            )
+        ),
+    )
+
+
+def build_cycle_cmd(
+    args: argparse.Namespace,
+    script_dir: Path,
+    run_dir: Path,
+    apply_next: bool,
+    *,
+    budget: RunBudget | None = None,
+    max_probes_override: int | None = None,
+    max_output_bytes_override: int | None = None,
+) -> list[str]:
     cmd = [
         sys.executable,
         str(script_dir / "run_qa_cycle.py"),
@@ -3326,6 +3957,32 @@ def build_cycle_cmd(args: argparse.Namespace, script_dir: Path, run_dir: Path, a
     for service_id in args.required_service or []:
         cmd.extend(["--required-service", service_id])
     cmd.extend(["--service-start-timeout", str(args.service_start_timeout)])
+    (
+        total_timeout,
+        stage_timeout,
+        max_probes,
+        max_output_bytes,
+        termination_grace,
+    ) = cycle_budget_values(
+        args,
+        budget,
+        max_probes_override=max_probes_override,
+        max_output_bytes_override=max_output_bytes_override,
+    )
+    cmd.extend(
+        [
+            "--total-timeout-seconds",
+            str(total_timeout),
+            "--stage-timeout-seconds",
+            str(stage_timeout),
+            "--max-probes",
+            str(max_probes),
+            "--max-output-bytes",
+            str(max_output_bytes),
+            "--termination-grace-seconds",
+            str(termination_grace),
+        ]
+    )
     return cmd
 
 
@@ -3852,6 +4509,173 @@ def blocked_preview_summary_from_status(run_dir: Path, status: dict[str, Any], *
     return skipped_preview_summary(run_dir, preview_current=False)
 
 
+def execution_boundary_reason(result: dict[str, Any] | None) -> str | None:
+    """提取受控终止原因；普通非零子进程不属于执行边界。"""
+
+    if not isinstance(result, dict):
+        return None
+    reason = result.get("termination_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    budget_error = result.get("budget_error")
+    if isinstance(budget_error, dict):
+        budget_reason = budget_error.get("reason")
+        if isinstance(budget_reason, str) and budget_reason:
+            return budget_reason
+    return None
+
+
+def execution_boundary_reason_code(reason: str) -> str:
+    """把底层原因映射为外层循环稳定原因码。"""
+
+    return {
+        BudgetReason.DEADLINE_EXCEEDED.value:
+            "agent_loop_deadline_exceeded",
+        BudgetReason.STAGE_TIMEOUT.value:
+            "agent_loop_stage_timeout",
+        BudgetReason.OUTPUT_BYTE_LIMIT.value:
+            "agent_loop_output_limit",
+        BudgetReason.PROBE_LIMIT.value:
+            "agent_loop_probe_limit",
+        BudgetReason.CANCELLED.value:
+            "agent_loop_cancelled",
+        "spawn_error": "agent_loop_spawn_failed",
+        "executor_error": "agent_loop_executor_failed",
+        "process_group_cleanup": "agent_loop_process_group_cleanup",
+    }.get(reason, "agent_loop_execution_boundary_failed")
+
+
+def execution_boundary_analysis(
+    reason: str,
+    *,
+    stage: str,
+) -> dict[str, Any]:
+    """构造不可解锁 PASS 的执行边界失败分析。"""
+
+    reason_code = execution_boundary_reason_code(reason)
+    return {
+        "category": "agent_loop_execution_boundary",
+        "blocking_layer": "agent_loop",
+        "source": "process_executor",
+        "reason_codes": [reason_code],
+        "operator_hint": (
+            f"Inspect the {stage} receipt, then resume with a fresh or larger "
+            "budget only after confirming the interrupted action is safe."
+        ),
+        "confidence": "high",
+    }
+
+
+def execution_boundary_projection(
+    result: dict[str, Any],
+    *,
+    stage: str,
+    budget: RunBudget | None,
+) -> dict[str, Any]:
+    """从命令收据生成结构化外层边界记录。"""
+
+    reason = execution_boundary_reason(result) or "executor_error"
+    budget_error = (
+        result.get("budget_error")
+        if isinstance(result.get("budget_error"), dict)
+        else None
+    )
+    budget_snapshot = (
+        budget.snapshot().to_dict()
+        if budget is not None
+        else (
+            budget_error.get("budget")
+            if isinstance(budget_error, dict)
+            else None
+        )
+    )
+    return {
+        "stage": stage,
+        "termination_reason": reason,
+        "reason_code": execution_boundary_reason_code(reason),
+        "exit_code": result.get("exit_code"),
+        "raw_exit_code": result.get("raw_exit_code"),
+        "timed_out": bool(result.get("timed_out")),
+        "budget_error": budget_error,
+        "budget": budget_snapshot,
+        "output_bytes": result.get("output_bytes"),
+        "started_at": result.get("started_at"),
+        "finished_at": result.get("finished_at"),
+    }
+
+
+def execution_boundary_action(
+    boundary: dict[str, Any],
+) -> dict[str, Any]:
+    """构造必须人工确认后才能恢复的下一动作。"""
+
+    reason = str(boundary.get("termination_reason") or "executor_error")
+    stage = str(boundary.get("stage") or "command")
+    analysis = execution_boundary_analysis(reason, stage=stage)
+    return {
+        "action": "resume_after_execution_boundary",
+        "automatable": False,
+        "reason": (
+            f"The outer QA agent loop stopped {stage} at the execution "
+            f"boundary: {reason}."
+        ),
+        "reason_codes": analysis["reason_codes"],
+        "evidence": [
+            "qa-agent-summary.json",
+            "qa-agent-handoff.md",
+        ],
+        "execution_boundary": boundary,
+        "failure_analysis": analysis,
+    }
+
+
+def execution_boundary_final(
+    boundary: dict[str, Any],
+) -> dict[str, Any]:
+    """生成确定性的 Inconclusive 终局，禁止复用旧 PASS。"""
+
+    reason = str(boundary.get("termination_reason") or "executor_error")
+    stage = str(boundary.get("stage") or "command")
+    analysis = execution_boundary_analysis(reason, stage=stage)
+    return {
+        "verdict": "Inconclusive",
+        "can_claim_pass": False,
+        "reason_codes": analysis["reason_codes"],
+        "failure_analysis": analysis,
+        "execution_boundary": boundary,
+    }
+
+
+def apply_execution_boundary_summary(
+    summary: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    stage: str,
+    budget: RunBudget | None,
+) -> dict[str, Any]:
+    """将受控终止写入 summary 的权威非 PASS 状态。"""
+
+    boundary = execution_boundary_projection(
+        result,
+        stage=stage,
+        budget=budget,
+    )
+    next_action = execution_boundary_action(boundary)
+    reason = str(boundary.get("termination_reason") or "")
+    summary["status"] = "failed"
+    summary["stop_reason"] = (
+        "agent_loop_cancelled"
+        if reason == BudgetReason.CANCELLED.value
+        else "agent_loop_execution_boundary"
+    )
+    summary["execution_boundary"] = boundary
+    summary["next_action"] = next_action
+    summary["failure_analysis"] = next_action["failure_analysis"]
+    if budget is not None:
+        summary["budget"] = budget.snapshot().to_dict()
+    return next_action
+
+
 def build_next_action(
     *,
     args: argparse.Namespace,
@@ -4072,7 +4896,11 @@ def build_next_action(
     })
 
 
-def main() -> int:
+def _main() -> int:
+    global _ACTIVE_RUN_BUDGET
+    global _ACTIVE_RUN_SESSION
+    global _ACTIVE_TERMINATION_GRACE_SECONDS
+
     parser = argparse.ArgumentParser(description="Run a bounded QA/backtest agent loop over a generated QA artifact directory.")
     parser.add_argument("--run-dir", help="Existing QA artifact directory. If omitted, init_qa_artifact.py is run first.")
     parser.add_argument("--requirement-file")
@@ -4085,6 +4913,36 @@ def main() -> int:
     parser.add_argument("--out-dir", default=str(Path("/tmp") / "automated-qa-test"))
     parser.add_argument("--slug")
     parser.add_argument("--max-iterations", type=int, default=3)
+    parser.add_argument(
+        "--total-timeout-seconds",
+        type=positive_float_arg,
+        default=DEFAULT_TOTAL_TIMEOUT_SECONDS,
+        help="Maximum wall-clock seconds for the complete agent loop.",
+    )
+    parser.add_argument(
+        "--stage-timeout-seconds",
+        type=positive_float_arg,
+        default=DEFAULT_STAGE_TIMEOUT_SECONDS,
+        help="Maximum wall-clock seconds for each outer helper command.",
+    )
+    parser.add_argument(
+        "--max-probes",
+        type=positive_int_arg,
+        default=DEFAULT_MAX_PROBES,
+        help="Maximum executable probes reserved across the complete agent loop.",
+    )
+    parser.add_argument(
+        "--max-output-bytes",
+        type=positive_int_arg,
+        default=DEFAULT_MAX_OUTPUT_BYTES,
+        help="Maximum combined child stdout/stderr bytes for the agent loop.",
+    )
+    parser.add_argument(
+        "--termination-grace-seconds",
+        type=non_negative_float_arg,
+        default=DEFAULT_TERMINATION_GRACE_SECONDS,
+        help="TERM-to-KILL grace period for managed process groups.",
+    )
     parser.add_argument("--skip-probe", action="store_true", help="Planning-only mode; run_qa_cycle.py writes skipped probe results.")
     parser.add_argument("--strict-runtime", action="store_true")
     parser.add_argument("--require-environment-boundary", action="store_true", help="Require confirmed runtime/data boundary before pass can be claimed.")
@@ -4123,14 +4981,43 @@ def main() -> int:
     if not args.run_dir and not (args.requirement_file or args.requirement_text):
         raise SystemExit("Provide --run-dir or requirement input.")
 
+    loop_budget = RunBudget(
+        total_timeout=args.total_timeout_seconds,
+        default_stage_timeout=args.stage_timeout_seconds,
+        max_probes=args.max_probes,
+        max_output_bytes=args.max_output_bytes,
+    )
+    _ACTIVE_RUN_BUDGET = loop_budget
+    _ACTIVE_TERMINATION_GRACE_SECONDS = (
+        args.termination_grace_seconds
+    )
     script_dir = Path(__file__).resolve().parent
     cwd = Path.cwd()
     try:
-        run_dir, init_result = init_run_dir(args, script_dir, cwd)
+        run_dir, init_result = init_run_dir(
+            args,
+            script_dir,
+            cwd,
+            budget=loop_budget,
+        )
     except InitializationError as exc:
         agent_summary_path = Path(args.summary).expanduser().resolve() if args.summary else (exc.run_dir / "qa-agent-summary.json" if exc.run_dir else initialization_failure_summary_path(args))
         write_initialization_failure_summary(args, agent_summary_path, exc)
         print(agent_summary_path)
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        _ACTIVE_RUN_SESSION = RunSession.open(
+            run_dir,
+            owner_prefix=AGENT_OWNER_PREFIX,
+        )
+    except LeaseAlreadyHeldError as exc:
+        conflict_summary_path = write_writer_conflict_summary(
+            args,
+            run_dir,
+            exc,
+        )
+        print(conflict_summary_path)
         print(str(exc), file=sys.stderr)
         return 1
     agent_summary_path = Path(args.summary).expanduser().resolve() if args.summary else run_dir / "qa-agent-summary.json"
@@ -4143,6 +5030,8 @@ def main() -> int:
         "max_iterations": args.max_iterations,
         "planning_only": bool(args.skip_probe),
         "iterations": [],
+        "budget": loop_budget.snapshot().to_dict(),
+        "session": _ACTIVE_RUN_SESSION.to_dict(),
     }
     if init_result:
         summary["init"] = init_result
@@ -4246,8 +5135,53 @@ def main() -> int:
                 write_json(agent_summary_path, summary)
                 exit_code = 1
                 break
-        cycle_cmd = build_cycle_cmd(args, script_dir, run_dir, apply_next=apply_next)
-        cycle_result = run_command(cycle_cmd, cwd=run_dir)
+        cycle_started_at_epoch = time.time()
+        cycle_cmd = [
+            sys.executable,
+            str(script_dir / "run_qa_cycle.py"),
+            "--run-dir",
+            str(run_dir),
+        ]
+        try:
+            (
+                reserved_probe_count,
+                cycle_probe_allowance,
+                cycle_output_allowance,
+            ) = reserve_cycle_resources(run_dir, loop_budget)
+            cycle_cmd = build_cycle_cmd(
+                args,
+                script_dir,
+                run_dir,
+                apply_next=apply_next,
+                budget=loop_budget,
+                max_probes_override=cycle_probe_allowance,
+                max_output_bytes_override=cycle_output_allowance,
+            )
+        except BudgetExceeded as exc:
+            cycle_result = budget_boundary_result(
+                cycle_cmd,
+                run_dir,
+                "qa_cycle",
+                exc,
+                started_at_epoch=cycle_started_at_epoch,
+                started=False,
+            )
+        else:
+            cycle_result = execute_loop_command(
+                cycle_cmd,
+                run_dir,
+                loop_budget,
+                stage="qa_cycle",
+            )
+            cycle_result = reconcile_cycle_probe_reservation(
+                run_dir,
+                loop_budget,
+                reserved_probe_count=reserved_probe_count,
+                command=cycle_cmd,
+                result=cycle_result,
+                started_at_epoch=cycle_started_at_epoch,
+            )
+        summary["budget"] = loop_budget.snapshot().to_dict()
         preview_result: dict[str, Any] | None = None
         preview_skipped_reason: str | None = None
         status = cycle_status(run_dir, cycle_result=cycle_result, applied_next_before_cycle=apply_next, preview_result=None)
@@ -4255,17 +5189,39 @@ def main() -> int:
             if status.get("can_claim_pass") is True:
                 preview_skipped_reason = "verdict_passed"
             else:
-                preview_result = run_command(build_preview_cmd(args, script_dir, run_dir), cwd=run_dir)
+                preview_result = execute_loop_command(
+                    build_preview_cmd(args, script_dir, run_dir),
+                    run_dir,
+                    loop_budget,
+                    stage="next_probe_preview",
+                )
+                summary["budget"] = loop_budget.snapshot().to_dict()
                 status = cycle_status(run_dir, cycle_result=cycle_result, applied_next_before_cycle=apply_next, preview_result=preview_result)
+        boundary_result: dict[str, Any] | None = None
+        boundary_stage: str | None = None
+        if execution_boundary_reason(cycle_result):
+            boundary_result = cycle_result
+            boundary_stage = "qa_cycle"
+        elif execution_boundary_reason(preview_result):
+            boundary_result = preview_result
+            boundary_stage = "next_probe_preview"
         snapshot = snapshot_iteration(run_dir, iteration)
-        next_action = build_next_action(
-            args=args,
-            run_dir=run_dir,
-            iteration=iteration,
-            cycle_result=cycle_result,
-            preview_result=preview_result,
-            status=status,
-        )
+        if boundary_result is not None and boundary_stage is not None:
+            boundary = execution_boundary_projection(
+                boundary_result,
+                stage=boundary_stage,
+                budget=loop_budget,
+            )
+            next_action = execution_boundary_action(boundary)
+        else:
+            next_action = build_next_action(
+                args=args,
+                run_dir=run_dir,
+                iteration=iteration,
+                cycle_result=cycle_result,
+                preview_result=preview_result,
+                status=status,
+            )
         preview_next_probes_hash = next_action.get("preview_next_probes_sha256") or next_action.get("expected_next_probes_sha256")
         if next_action.get("automatable") is True and isinstance(preview_next_probes_hash, str) and preview_next_probes_hash:
             repeated_next_probes = prior_next_probes_hash_seen(summary, preview_next_probes_hash)
@@ -4289,10 +5245,21 @@ def main() -> int:
         if snapshot.get("errors"):
             summary.setdefault("snapshot_errors", []).extend(snapshot["errors"])
         summary["iterations"].append(item)
+        if boundary_result is not None and boundary_stage is not None:
+            next_action = apply_execution_boundary_summary(
+                summary,
+                boundary_result,
+                stage=boundary_stage,
+                budget=loop_budget,
+            )
+            item["next_action"] = next_action
         summary["next_action"] = next_action
         summary["loop_control"] = build_loop_control(summary)
         write_json(agent_summary_path, summary)
 
+        if boundary_result is not None:
+            exit_code = 1
+            break
         if cycle_result["exit_code"] != 0:
             if status.get("verdict"):
                 summary["status"] = status.get("verdict")
@@ -4354,7 +5321,12 @@ def main() -> int:
         apply_next = True
 
     summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
-    if summary.get("iterations"):
+    summary["budget"] = loop_budget.snapshot().to_dict()
+    if isinstance(summary.get("execution_boundary"), dict):
+        summary["final"] = execution_boundary_final(
+            summary["execution_boundary"]
+        )
+    elif summary.get("iterations"):
         last_iteration = summary["iterations"][-1]
         summary["final"] = cycle_status(
             run_dir,
@@ -4379,6 +5351,44 @@ def main() -> int:
     write_agent_handoff(agent_summary_path, summary)
     write_json(agent_summary_path, summary)
     print(agent_summary_path)
+    return exit_code
+
+
+def main() -> int:
+    """运行一次外层循环，并在所有最终写入后释放单写租约。"""
+
+    global _ACTIVE_RUN_BUDGET
+    global _ACTIVE_RUN_SESSION
+    global _ACTIVE_TERMINATION_GRACE_SECONDS
+
+    release_error: RunLeaseError | None = None
+    try:
+        exit_code = _main()
+    finally:
+        if _ACTIVE_RUN_SESSION is not None:
+            try:
+                _ACTIVE_RUN_SESSION.close()
+            except RunLeaseError as exc:
+                release_error = exc
+            finally:
+                _ACTIVE_RUN_SESSION = None
+        _ACTIVE_RUN_BUDGET = None
+        _ACTIVE_TERMINATION_GRACE_SECONDS = (
+            DEFAULT_TERMINATION_GRACE_SECONDS
+        )
+    if release_error is not None:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "error": "agent_loop_session_release_failed",
+                    "detail": str(release_error),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 73
     return exit_code
 
 

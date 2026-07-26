@@ -53,6 +53,31 @@ python3 skills/automated-qa-test/scripts/run_qa_cycle.py \
 
 含 `command` 的计划必须把 `playwright_probe.mjs` 绑定到通过的 `plan-audit-summary.json`，且摘要中的计划路径和哈希必须与当前文件完全一致。shell 字符串和 `shell: true` 默认拒绝，应使用关闭 shell 执行的数组命令；`--allow-unsafe-command` 只能放宽普通 shell 边界，不能放行秘密文件读取、导出、上传、写入或其他秘密变更。所有输出默认必须位于 `--run-dir` 内；若输出目标是目录，系统会保留目录并阻断，不会递归删除。
 
+## 携证运行内核
+
+每个 cycle 与外层 Agent loop 现在都只有一份总墙钟/探针/输出预算和一个逻辑写入者。cycle 持有带 generation 围栏的文件租约，追加哈希链事件，把本轮 current 输出提交为不可变 attempt；只有独立只读 verifier 闭合“状态 → manifest → attempt → 当前输入”证明图后，才允许发布 `Passed`。旧文件、父输入替换、未提交 verdict、历史 attempt、损坏事件或并发写者都会默认失败关闭。
+
+默认上限为：整轮 1,800 秒、单阶段 300 秒、500 个探针、16 MiB 子进程输出，以及 2 秒 TERM→KILL 宽限。可显式覆盖：
+
+```bash
+python3 skills/automated-qa-test/scripts/run_qa_cycle.py \
+  --run-dir /path/to/run \
+  --total-timeout-seconds 1800 \
+  --stage-timeout-seconds 300 \
+  --max-probes 500 \
+  --max-output-bytes 16777216 \
+  --termination-grace-seconds 2
+```
+
+`qa_agent_loop.py` 会跨全部 iteration 累计这些额度，新一轮不会刷新探针或输出预算。可独立复核一个已完成的通过结论：
+
+```bash
+python3 skills/automated-qa-test/scripts/verify_run_proof.py \
+  --run-dir /path/to/run
+```
+
+`qa-run-summary.json` 与报告仍只是 projection。权威链由 `run-events.jsonl`、`run-manifest.json`、其引用的不可变 attempt，以及当前且哈希绑定的 verdict 构成。
+
 ## 默认失败关闭门
 
 默认只有同时满足以下条件，`can_claim_pass` 才可能为 `true`：
@@ -95,11 +120,13 @@ python3 skills/automated-qa-test/scripts/audit_evidence.py \
 
 ## 架构边界
 
-`scripts/*.py` 保持稳定的命令行兼容入口；`scripts/qa_core/contracts` 集中拥有产物路径、JSON Schema 运行时校验、证据字段和 runner 绑定规则，`scripts/qa_core/pipeline` 集中拥有 `CycleOptions`、`CycleContext` 与统一的阶段执行/记账边界。`CycleRuntime` 依次组合需求覆盖、预检、Adapter、计划、探针、证据和结论阶段。审计、verdict、报告和周期编排共享这些契约，不再各自维护一份近似实现。
+`scripts/*.py` 保持稳定的命令行兼容入口；`scripts/qa_core/contracts` 集中拥有产物路径、JSON Schema 运行时校验、证据字段和 runner 绑定规则，`scripts/qa_core/pipeline` 集中拥有 `CycleOptions`、`CycleContext` 与统一的阶段执行/记账边界。`scripts/qa_core/runtime`、`state`、`proof` 分别拥有有界进程、租约、不可变 attempt、事件归约和证明验证；`scripts/qa_core/tools` 与 `agent` 拥有严格 ToolSpec、proposal、policy 和执行授权合同，模型输出只能是提案，不能自我授权。`CycleRuntime` 依次组合需求覆盖、预检、Adapter、计划、探针、证据和结论阶段。
 
 脚手架内部遵循 `qa_scaffold/support → intents → modeling → rules → entry` 单向依赖，原 `scaffold_requirement.py` 继续提供既有 Python 导入和 CLI；需求分类被拆为信号采集、冲突消歧和 3 个标签投影族，需求专属证据映射以及基础、韧性、认证、完整性、高级、UI 交互和运行时规则均由原公开入口调度有界的私有领域助手。回归侧将代码 PR、需求源覆盖和 Agent 路由协议分别放入仅依赖 support 的专属模块，再由 `contracts` 或 `agent` 兼容导出稳定夹具入口；构建发布与秘密安全夹具继续拆为私有子场景注册表，同时保持 7 族公开夹具契约不变。`regression_check.py` 只负责夹具注册、完整阶段编排和 CLI；架构测试持续约束依赖方向、有界私有场景注册表与兼容导出。
 
 CI 会在编译和测试前执行 Ruff `E`、`F`、`I` 门禁。需求与夹具中的长篇原文明确不受 `E501` 数值限制，测试启动器允许在显式设置本地 `sys.path` 后导入；未使用导入、死局部变量和导入顺序仍会阻断 CI。
+
+生产候选的架构、不变量、SLO 与 held-out 协议见 [`CONTEXT.md`](CONTEXT.md) 和 [`docs/architecture/agent-v2.md`](docs/architecture/agent-v2.md)。`agent_eval.py` 是严格的 evaluator-owned 评分器，不代表项目已经跑过生产语料；正式资格仍要求由独立方冻结 200 个场景 × 3 个 seed 的语料和 deterministic baseline。
 
 ## 运行产物与状态
 

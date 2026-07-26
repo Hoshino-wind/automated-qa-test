@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from typing import Sequence
+
+DEFAULT_TOTAL_TIMEOUT_SECONDS = 1800.0
+DEFAULT_STAGE_TIMEOUT_SECONDS = 300.0
+DEFAULT_MAX_PROBES = 500
+DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+DEFAULT_TERMINATION_GRACE_SECONDS = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +74,11 @@ class CycleOptions:
     skip_probe: bool
     skip_report: bool
     allow_external_output_paths: bool
+    total_timeout_seconds: float
+    stage_timeout_seconds: float
+    max_probes: int
+    max_output_bytes: int
+    termination_grace_seconds: float
 
 
 def build_cycle_parser() -> argparse.ArgumentParser:
@@ -135,6 +147,36 @@ def build_cycle_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly allow generated output files outside --run-dir. Directory-shaped targets are still rejected.",
     )
+    parser.add_argument(
+        "--total-timeout-seconds",
+        type=_positive_float,
+        default=DEFAULT_TOTAL_TIMEOUT_SECONDS,
+        help="Maximum wall-clock seconds for the complete cycle.",
+    )
+    parser.add_argument(
+        "--stage-timeout-seconds",
+        type=_positive_float,
+        default=DEFAULT_STAGE_TIMEOUT_SECONDS,
+        help="Maximum wall-clock seconds for each helper or probe stage.",
+    )
+    parser.add_argument(
+        "--max-probes",
+        type=_positive_int,
+        default=DEFAULT_MAX_PROBES,
+        help="Maximum executable plan steps reserved by the probe stage.",
+    )
+    parser.add_argument(
+        "--max-output-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_OUTPUT_BYTES,
+        help="Maximum combined child-process stdout/stderr bytes for the cycle.",
+    )
+    parser.add_argument(
+        "--termination-grace-seconds",
+        type=_non_negative_float,
+        default=DEFAULT_TERMINATION_GRACE_SECONDS,
+        help="TERM-to-KILL grace period for a timed out or cancelled process group.",
+    )
     return parser
 
 
@@ -144,3 +186,37 @@ def parse_cycle_options(argv: Sequence[str] | None = None) -> CycleOptions:
         values["require_environment_boundary"] or not values["allow_unconfirmed_environment"]
     )
     return CycleOptions(**values)
+
+
+def _positive_float(value: str) -> float:
+    normalized = _finite_float(value)
+    if normalized <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return normalized
+
+
+def _non_negative_float(value: str) -> float:
+    normalized = _finite_float(value)
+    if normalized < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return normalized
+
+
+def _finite_float(value: str) -> float:
+    try:
+        normalized = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be numeric") from exc
+    if not math.isfinite(normalized):
+        raise argparse.ArgumentTypeError("value must be finite")
+    return normalized
+
+
+def _positive_int(value: str) -> int:
+    try:
+        normalized = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if normalized <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return normalized

@@ -3,12 +3,43 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from qa_common import atomic_write_json, is_within
+from qa_common import atomic_write_json, file_sha256, is_within
+from qa_core.contracts.artifacts import ARTIFACT_FILENAMES
 from qa_core.pipeline import CycleContext, CycleOptions, StageRunner, parse_cycle_options
+from qa_core.proof import (
+    ProofVerificationResult,
+    canonical_json_sha256,
+    input_file_sha256,
+    verify_run_proof,
+)
+from qa_core.runtime import (
+    CYCLE_OUTPUT_NAMES,
+    CYCLE_OWNER_PREFIX,
+    AttemptStore,
+    CycleAttemptError,
+    CycleAttemptResult,
+    ProcessExecutor,
+    RunBudget,
+    RunSession,
+    RunStateCoordinator,
+    commit_cycle_attempt,
+)
+from qa_core.runtime.lease import RunLeaseError
+from qa_core.state import EventLogError
+from qa_core.tools import build_default_tool_registry
+
+CONTROL_BOUNDARY_EXIT_CODE = 73
+COMPONENT_VERSIONS = {
+    "qa_cycle": "2",
+    "run_budget": "1",
+    "run_lease": "1",
+    "run_state": "1",
+}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -79,6 +110,73 @@ def make_skipped_results(plan_path: Path, run_dir: Path, reason: str) -> dict[st
         "failedResponses": [],
         "requestFailures": [],
     }
+
+
+def plan_probe_count(plan_path: Path) -> int:
+    """计算本轮执行器将接收的计划步骤数。"""
+
+    plan = load_json(plan_path)
+    scenarios = plan.get("scenarios")
+    if not isinstance(scenarios, list):
+        return 0
+    return sum(
+        len(steps)
+        for scenario in scenarios
+        if isinstance(scenario, dict)
+        and isinstance((steps := scenario.get("steps")), list)
+    )
+
+
+def derive_run_goal(requirement_path: Path) -> str:
+    """从需求首个非空标题派生稳定目标，读取失败时使用保守默认值。"""
+
+    if requirement_path.is_file():
+        try:
+            for line in requirement_path.read_text(
+                encoding="utf-8",
+            ).splitlines():
+                normalized = line.strip().lstrip("#").strip()
+                if normalized:
+                    return normalized[:500]
+        except OSError:
+            pass
+    return "Execute a proof-carrying QA cycle without unsupported pass claims"
+
+
+def control_boundary_error(
+    error: BaseException,
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    """把租约或状态故障投影为稳定、可机器消费的错误。"""
+
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "error": "qa_control_boundary_error",
+        "phase": phase,
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+    if isinstance(error, EventLogError):
+        payload["detail"] = error.to_dict()
+    current = getattr(error, "current", None)
+    if current is not None and hasattr(current, "to_dict"):
+        payload["current_lease"] = current.to_dict()
+    return payload
+
+
+def print_control_boundary_error(
+    error: BaseException,
+    *,
+    phase: str,
+) -> None:
+    print(
+        json.dumps(
+            control_boundary_error(error, phase=phase),
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
 
 
 def fail(summary: dict[str, Any], message: str, out_path: Path, *, status: str = "failed") -> int:
@@ -175,7 +273,21 @@ def write_cycle_error(
     if result:
         payload["result"] = {
             key: result.get(key)
-            for key in ("command", "cwd", "started_at", "finished_at", "exit_code", "stdout", "stderr")
+            for key in (
+                "command",
+                "cwd",
+                "started_at",
+                "finished_at",
+                "exit_code",
+                "raw_exit_code",
+                "timed_out",
+                "termination_reason",
+                "budget_error",
+                "stdout",
+                "stderr",
+                "stdout_bytes",
+                "stderr_bytes",
+            )
             if key in result
         }
     write_json(path, payload)
@@ -214,6 +326,7 @@ def write_minimal_error_verdict(verdict_path: Path, cycle_error_path: Path, *, c
 def generate_verdict_handoff(
     summary: dict[str, Any],
     *,
+    stage_runner: StageRunner,
     script_dir: Path,
     run_dir: Path,
     ledger_path: Path,
@@ -275,7 +388,7 @@ def generate_verdict_handoff(
         verdict_cmd.append("--require-environment-boundary")
     if allow_missing_requirement_coverage:
         verdict_cmd.append("--allow-missing-requirement-coverage")
-    StageRunner(summary, run_command).run("generate_verdict_handoff", verdict_cmd, cwd=run_dir)
+    stage_runner.run("generate_verdict_handoff", verdict_cmd, cwd=run_dir)
     summary.setdefault("paths", {})["verdict"] = str(verdict_path) if verdict_path.exists() else None
     if verdict_path.exists():
         current_artifacts.add(verdict_path.resolve())
@@ -289,7 +402,12 @@ def generate_verdict_handoff(
 class CycleRuntime:
     """拥有单次 QA 周期的选项、路径与当前产物状态。"""
 
-    def __init__(self, args: CycleOptions) -> None:
+    def __init__(
+        self,
+        args: CycleOptions,
+        *,
+        session: RunSession,
+    ) -> None:
         self.args = args
         self.context = CycleContext.from_namespace(script_dir=Path(__file__).resolve().parent, args=args)
         self.script_dir = self.context.script_dir
@@ -321,8 +439,347 @@ class CycleRuntime:
         self.summary_path = self.artifacts.summary
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.summary = self.context.summary
-        self.stage_runner = StageRunner(self.summary, run_command)
+        self.budget = RunBudget(
+            total_timeout=args.total_timeout_seconds,
+            default_stage_timeout=args.stage_timeout_seconds,
+            max_probes=args.max_probes,
+            max_output_bytes=args.max_output_bytes,
+        )
+        self.summary["budget"] = self.budget.snapshot().to_dict()
+        self.session = session
+        self.cycle_options_sha256 = canonical_json_sha256(
+            asdict(self.args)
+        )
+        self.tool_registry_sha256 = (
+            build_default_tool_registry().canonical_sha256
+        )
+        self.state = RunStateCoordinator.open(
+            session,
+            goal=derive_run_goal(self.requirement_path),
+            scope=[
+                str(self.plan_path),
+                str(self.matrix_path),
+                str(self.requirement_path),
+            ],
+            component_versions={
+                **COMPONENT_VERSIONS,
+                "cycle_options_sha256": self.cycle_options_sha256,
+                "tool_registry_sha256": self.tool_registry_sha256,
+            },
+            initial_budget=self.summary["budget"],
+        )
+        self.summary["run_session"] = session.to_dict()
+        self.summary["run_state"] = self.state.projection()
+        self.stage_runner = StageRunner(
+            self.summary,
+            run_command,
+            stage_executor=self.execute_stage,
+        )
         self.current_artifacts = self.context.current_artifacts
+
+    def enter_phase(self, phase: str) -> None:
+        """在执行顶层阶段前推进租约心跳与可恢复状态。"""
+
+        self.state.before_stage(phase)
+        self.summary["run_state"] = self.state.projection()
+
+    def execute_stage(
+        self,
+        name: str,
+        command: list[str],
+        cwd: Path | None,
+        probe_count: int,
+    ) -> dict[str, Any]:
+        """统一执行阶段并持续投影预算消耗。"""
+
+        self.state.before_stage(name)
+        result = ProcessExecutor(
+            self.budget,
+            name,
+            termination_grace=self.args.termination_grace_seconds,
+        ).run(
+            command,
+            cwd=cwd,
+            probe_count=probe_count,
+        )
+        self.summary["budget"] = self.budget.snapshot().to_dict()
+        self.state.update_budget(self.summary["budget"])
+        self.summary["run_state"] = self.state.projection()
+        if result.get("termination_reason"):
+            boundary_error = {
+                "stage": name,
+                "termination_reason": result.get("termination_reason"),
+                "budget_error": result.get("budget_error"),
+                "exit_code": result.get("exit_code"),
+                "raw_exit_code": result.get("raw_exit_code"),
+            }
+            self.summary.setdefault(
+                "execution_boundary_errors",
+                [],
+            ).append(boundary_error)
+            if not self.summary.get("cycle_error"):
+                code = (
+                    "cycle_budget_exceeded"
+                    if result.get("budget_error")
+                    else "cycle_execution_boundary_failed"
+                )
+                message = (
+                    f"Stage {name} stopped at the execution boundary: "
+                    f"{result.get('termination_reason')}."
+                )
+                cycle_error = write_cycle_error(
+                    self.cycle_error_path,
+                    code=code,
+                    phase=name,
+                    message=message,
+                    result=result,
+                )
+                self.summary["cycle_error"] = cycle_error
+                self.summary.setdefault(
+                    "paths",
+                    {},
+                )["cycle_error"] = str(self.cycle_error_path)
+                self.current_artifacts.add(
+                    self.cycle_error_path.resolve()
+                )
+                self.summary["verdict"] = write_minimal_error_verdict(
+                    self.verdict_path,
+                    self.cycle_error_path,
+                    code=code,
+                    phase=name,
+                    message=message,
+                )
+                self.current_artifacts.add(self.verdict_path.resolve())
+        return result
+
+    def complete_state(self, exit_code: int) -> int:
+        """先发布不可变 attempt，再把最终裁决绑定到事件链。"""
+
+        budget = self.budget.snapshot().to_dict()
+        self.summary["budget"] = budget
+        attempt_ref: dict[str, Any] | None = None
+        verdict_committed = False
+        effective_exit_code = exit_code
+        try:
+            self.state.before_stage("commit_cycle_attempt")
+            committed = self.commit_attempt(exit_code)
+            self.summary["attempt_commit"] = committed.to_dict()
+            verdict_hash = file_sha256(self.verdict_path)
+            verdict_committed = any(
+                artifact.name == "qa-verdict.json"
+                and artifact.sha256 == verdict_hash
+                for artifact in committed.attempt.artifacts
+            )
+            attempt_ref = {
+                "attempt_id": committed.attempt.attempt_id,
+                "attempt_manifest_sha256": (
+                    committed.attempt.manifest_sha256
+                ),
+                "run_manifest_sequence": (
+                    committed.run_manifest_sequence
+                ),
+                "run_manifest_sha256": (
+                    committed.run_manifest_sha256
+                ),
+            }
+        except CycleAttemptError as error:
+            effective_exit_code = 1
+            self.record_attempt_failure(error)
+        self.state.finish(
+            exit_code=effective_exit_code,
+            verdict_path=self.verdict_path,
+            verdict_is_current=(
+                self.verdict_path.exists()
+                and self.verdict_path.resolve() in self.current_artifacts
+            ),
+            final_budget=budget,
+            attempt_ref=attempt_ref,
+            verdict_committed=verdict_committed,
+        )
+        if self.state.state.status == "passed":
+            proof = verify_run_proof(self.run_dir)
+            self.summary["proof_verification"] = proof.to_dict()
+            if not proof.can_claim_pass:
+                effective_exit_code = 1
+                self.record_proof_failure(proof)
+                reason_codes = ",".join(
+                    error["code"] for error in proof.errors
+                )
+                self.state.invalidate_pass(
+                    reason=reason_codes or "proof_graph_invalid",
+                )
+        self.summary["run_state"] = self.state.projection()
+        self.summary["status"] = self.state.state.status
+        return effective_exit_code
+
+    def commit_attempt(self, exit_code: int) -> CycleAttemptResult:
+        """把本轮 current 输出提交到内容校验后的不可变视图。"""
+
+        output_names = self.current_output_names()
+        if not output_names:
+            raise CycleAttemptError(
+                "cycle_outputs_empty",
+                "select_outputs",
+                "no canonical current cycle outputs are available",
+            )
+        try:
+            current_manifest = AttemptStore(
+                self.run_dir
+            ).read_run_manifest()
+        except Exception as error:
+            raise CycleAttemptError(
+                "cycle_manifest_preflight_failed",
+                "manifest_preflight",
+                str(error),
+                details={"cause_type": type(error).__name__},
+            ) from error
+        expected_sequence = (
+            int(current_manifest["sequence"])
+            if current_manifest is not None
+            else 0
+        )
+        return commit_cycle_attempt(
+            run_dir=self.run_dir,
+            run_id=self.session.run_id,
+            lease_owner=self.session.owner,
+            generation=self.session.generation,
+            iteration=expected_sequence + 1,
+            stage=(
+                "cycle_complete"
+                if exit_code == 0
+                else "cycle_handoff"
+            ),
+            tool="run_qa_cycle",
+            input_hashes=self.input_hashes(),
+            expected_sequence=expected_sequence,
+            output_names=output_names,
+            current_artifacts=self.current_artifacts,
+        )
+
+    def current_output_names(self) -> list[str]:
+        """仅选择 run-dir 内本轮明确标记 current 的标准输出。"""
+
+        selected: list[str] = []
+        for name in sorted(CYCLE_OUTPUT_NAMES - {"summary"}):
+            actual = getattr(self.artifacts, name)
+            canonical = self.run_dir / ARTIFACT_FILENAMES[name]
+            if (
+                actual == canonical
+                and actual.is_file()
+                and actual.resolve() in self.current_artifacts
+            ):
+                selected.append(name)
+        return selected
+
+    def input_hashes(self) -> dict[str, str]:
+        """绑定最终执行配置、工具注册表与所有可用直接输入。"""
+
+        hashes = {
+            "cycle_options": self.cycle_options_sha256,
+            "tool_registry": self.tool_registry_sha256,
+        }
+        for name, path in (
+            ("plan", self.plan_path),
+            ("matrix", self.matrix_path),
+            ("requirement", self.requirement_path),
+            ("adapter_context", self.adapter_context_path),
+        ):
+            hashes[name] = input_file_sha256(name, path)
+        return hashes
+
+    def record_attempt_failure(self, error: CycleAttemptError) -> None:
+        """Artifact Store 失败时覆盖任何已有 PASS 并保留诊断。"""
+
+        message = f"Cycle artifact commit failed: {error}"
+        self.summary["attempt_commit"] = error.to_dict()
+        cycle_error = write_cycle_error(
+            self.cycle_error_path,
+            code="cycle_attempt_commit_failed",
+            phase=error.phase,
+            message=message,
+        )
+        self.summary["cycle_error"] = cycle_error
+        self.summary.setdefault("paths", {})["cycle_error"] = str(
+            self.cycle_error_path
+        )
+        self.current_artifacts.add(self.cycle_error_path.resolve())
+        self.summary["verdict"] = write_minimal_error_verdict(
+            self.verdict_path,
+            self.cycle_error_path,
+            code="cycle_attempt_commit_failed",
+            phase=error.phase,
+            message=message,
+        )
+        self.current_artifacts.add(self.verdict_path.resolve())
+        self.summary["error"] = message
+
+    def record_proof_failure(
+        self,
+        proof: ProofVerificationResult,
+    ) -> None:
+        """最终 proof graph 不闭合时撤销 PASS 并生成非通过交接。"""
+
+        codes = [error["code"] for error in proof.errors]
+        message = (
+            "Final proof graph verification failed: "
+            + ", ".join(codes or ["unknown"])
+        )
+        cycle_error = write_cycle_error(
+            self.cycle_error_path,
+            code="proof_graph_invalid",
+            phase="proof_verification",
+            message=message,
+        )
+        self.summary["cycle_error"] = cycle_error
+        self.summary.setdefault("paths", {})["cycle_error"] = str(
+            self.cycle_error_path
+        )
+        self.current_artifacts.add(self.cycle_error_path.resolve())
+        self.summary["verdict"] = write_minimal_error_verdict(
+            self.verdict_path,
+            self.cycle_error_path,
+            code="proof_graph_invalid",
+            phase="proof_verification",
+            message=message,
+        )
+        self.current_artifacts.add(self.verdict_path.resolve())
+        self.summary["error"] = message
+
+    def emergency_state_failure(
+        self,
+        error: EventLogError,
+        *,
+        phase: str,
+    ) -> int:
+        """租约仍有效但状态不可写时，直接覆盖为非 PASS 交接。"""
+
+        message = f"Run state failed closed during {phase}: {error}"
+        cycle_error = write_cycle_error(
+            self.cycle_error_path,
+            code="run_state_unavailable",
+            phase=phase,
+            message=message,
+        )
+        self.summary["cycle_error"] = cycle_error
+        self.summary.setdefault("paths", {})["cycle_error"] = str(
+            self.cycle_error_path
+        )
+        self.summary["verdict"] = write_minimal_error_verdict(
+            self.verdict_path,
+            self.cycle_error_path,
+            code="run_state_unavailable",
+            phase=phase,
+            message=message,
+        )
+        self.summary["status"] = "inconclusive"
+        self.summary["error"] = message
+        self.summary["finished_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        write_json(self.summary_path, self.summary)
+        print(self.summary_path)
+        print_control_boundary_error(error, phase=phase)
+        return 1
 
     def fail_with_cycle_handoff(
         self,
@@ -332,18 +789,27 @@ class CycleRuntime:
         result: dict[str, Any] | None = None,
         code: str = "cycle_helper_failed",
     ) -> int:
-        cycle_error = write_cycle_error(
-            self.cycle_error_path,
-            code=code,
-            phase=phase,
-            message=message,
-            result=result,
+        boundary_error = bool(
+            result
+            and result.get("termination_reason")
+            and isinstance(self.summary.get("cycle_error"), dict)
         )
+        if boundary_error:
+            cycle_error = self.summary["cycle_error"]
+        else:
+            cycle_error = write_cycle_error(
+                self.cycle_error_path,
+                code=code,
+                phase=phase,
+                message=message,
+                result=result,
+            )
         self.summary["cycle_error"] = cycle_error
         self.summary.setdefault("paths", {})["cycle_error"] = str(self.cycle_error_path)
         self.current_artifacts.add(self.cycle_error_path.resolve())
         generate_verdict_handoff(
             self.summary,
+            stage_runner=self.stage_runner,
             script_dir=self.script_dir,
             run_dir=self.run_dir,
             ledger_path=self.ledger_path,
@@ -507,6 +973,7 @@ def run_requirement_coverage_stage(runtime: CycleRuntime) -> int | None:
         if coverage_result["exit_code"] != 0:
             generate_verdict_handoff(
                 summary,
+                stage_runner=stage_runner,
                 script_dir=script_dir,
                 run_dir=run_dir,
                 ledger_path=ledger_path,
@@ -597,6 +1064,7 @@ def run_preflight_stage(runtime: CycleRuntime) -> int | None:
         if preflight_result["exit_code"] != 0:
             generate_verdict_handoff(
                 summary,
+                stage_runner=stage_runner,
                 script_dir=script_dir,
                 run_dir=run_dir,
                 ledger_path=ledger_path,
@@ -645,6 +1113,7 @@ def run_preflight_stage(runtime: CycleRuntime) -> int | None:
             if runtime_result["exit_code"] != 0:
                 generate_verdict_handoff(
                     summary,
+                    stage_runner=stage_runner,
                     script_dir=script_dir,
                     run_dir=run_dir,
                     ledger_path=ledger_path,
@@ -685,6 +1154,7 @@ def run_preflight_stage(runtime: CycleRuntime) -> int | None:
             if preflight_after_start_result["exit_code"] != 0:
                 generate_verdict_handoff(
                     summary,
+                    stage_runner=stage_runner,
                     script_dir=script_dir,
                     run_dir=run_dir,
                     ledger_path=ledger_path,
@@ -905,6 +1375,7 @@ def run_planning_stage(runtime: CycleRuntime) -> int | None:
     if validate_result["exit_code"] != 0:
         generate_verdict_handoff(
             summary,
+            stage_runner=stage_runner,
             script_dir=script_dir,
             run_dir=run_dir,
             ledger_path=ledger_path,
@@ -968,6 +1439,7 @@ def run_probe_stage(runtime: CycleRuntime) -> int | None:
                 str(plan_audit_summary_path),
             ],
             cwd=probe_cwd,
+            probe_count=plan_probe_count(plan_path),
         )
         if probe_result["exit_code"] != 0:
             return fail_with_cycle_handoff("Probe runner failed before producing a usable result.", phase="probe", result=probe_result)
@@ -1074,6 +1546,7 @@ def run_evidence_stage(runtime: CycleRuntime) -> int | None:
         else:
             generate_verdict_handoff(
                 summary,
+                stage_runner=stage_runner,
                 script_dir=script_dir,
                 run_dir=run_dir,
                 ledger_path=ledger_path,
@@ -1279,15 +1752,31 @@ def finalize_cycle(runtime: CycleRuntime) -> int:
     summary = runtime.summary
 
     verdict = summary.get("verdict") or {}
-    summary["status"] = verdict.get("verdict") or "attention"
+    state_status = (summary.get("run_state") or {}).get("status")
+    summary["status"] = (
+        state_status
+        if isinstance(state_status, str) and state_status
+        else verdict.get("verdict") or "attention"
+    )
     summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
     write_json(summary_path, summary)
     print(summary_path)
     return 0
 
 
-def main() -> int:
-    runtime = CycleRuntime(parse_cycle_options())
+def run_with_session(
+    args: CycleOptions,
+    session: RunSession,
+) -> int:
+    """在已持有的单写租约内执行完整周期。"""
+
+    try:
+        runtime = CycleRuntime(args, session=session)
+    except EventLogError as error:
+        print_control_boundary_error(error, phase="state_initialization")
+        return CONTROL_BOUNDARY_EXIT_CODE
+
+    outcome: int | None = None
     for stage in (
         prepare_cycle,
         run_requirement_coverage_stage,
@@ -1298,10 +1787,70 @@ def main() -> int:
         run_evidence_stage,
         run_conclusion_stage,
     ):
-        outcome = stage(runtime)
+        try:
+            runtime.enter_phase(stage.__name__)
+            outcome = stage(runtime)
+        except RunLeaseError as error:
+            print_control_boundary_error(
+                error,
+                phase=stage.__name__,
+            )
+            return CONTROL_BOUNDARY_EXIT_CODE
+        except EventLogError as error:
+            return runtime.emergency_state_failure(
+                error,
+                phase=stage.__name__,
+            )
         if outcome is not None:
-            return outcome
+            break
+
+    exit_code = 0 if outcome is None else outcome
+    try:
+        exit_code = runtime.complete_state(exit_code)
+    except RunLeaseError as error:
+        print_control_boundary_error(error, phase="state_completion")
+        return CONTROL_BOUNDARY_EXIT_CODE
+    except EventLogError as error:
+        return runtime.emergency_state_failure(
+            error,
+            phase="state_completion",
+        )
+
+    if outcome is not None:
+        write_json(runtime.summary_path, runtime.summary)
+        return exit_code
+    if exit_code != 0:
+        runtime.summary["finished_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        write_json(runtime.summary_path, runtime.summary)
+        print(runtime.summary_path)
+        return exit_code
     return finalize_cycle(runtime)
+
+
+def main() -> int:
+    args = parse_cycle_options()
+    try:
+        session = RunSession.open(
+            Path(args.run_dir),
+            owner_prefix=CYCLE_OWNER_PREFIX,
+            allow_parent_inheritance=True,
+        )
+    except (RunLeaseError, EventLogError) as error:
+        print_control_boundary_error(error, phase="session_acquire")
+        return CONTROL_BOUNDARY_EXIT_CODE
+
+    exit_code = CONTROL_BOUNDARY_EXIT_CODE
+    try:
+        exit_code = run_with_session(args, session)
+    finally:
+        try:
+            session.close()
+        except RunLeaseError as error:
+            print_control_boundary_error(error, phase="session_release")
+            exit_code = CONTROL_BOUNDARY_EXIT_CODE
+    return exit_code
 
 
 if __name__ == "__main__":
