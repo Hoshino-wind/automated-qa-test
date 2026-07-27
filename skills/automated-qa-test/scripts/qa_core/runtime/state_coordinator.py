@@ -87,13 +87,31 @@ class RunStateCoordinator:
         )
         return coordinator
 
-    def before_stage(self, stage: str) -> None:
+    def before_stage(
+        self,
+        stage: str,
+        *,
+        command_sha256: str | None = None,
+    ) -> None:
         """先验证租约并记录阶段，再允许子进程启动。"""
 
         self._require_open()
+        payload: dict[str, Any] = {
+            "phase": _non_empty_text("stage", stage)
+        }
+        if command_sha256 is not None:
+            payload.update(
+                {
+                    "trace_required": True,
+                    "command_sha256": _sha256(
+                        "command_sha256",
+                        command_sha256,
+                    ),
+                }
+            )
         self._append(
             RunEventType.PHASE_CHANGED,
-            {"phase": _non_empty_text("stage", stage)},
+            payload,
         )
 
     def update_budget(self, budget: Mapping[str, Any]) -> None:
@@ -103,6 +121,18 @@ class RunStateCoordinator:
         self._append(
             RunEventType.BUDGET_UPDATED,
             {"budget": dict(budget)},
+        )
+
+    def record_component_versions(
+        self,
+        versions: Mapping[str, Any],
+    ) -> None:
+        """把本轮生成的内容哈希绑定到可恢复状态链。"""
+
+        self._require_open()
+        self._append(
+            RunEventType.COMPONENT_VERSIONS_RECORDED,
+            {"versions": dict(versions)},
         )
 
     def finish(
@@ -228,6 +258,17 @@ def _read_verdict(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     except (OSError, json.JSONDecodeError):
         return None, digest
     return (value if isinstance(value, dict) else None), digest
+
+
+def _sha256(name: str, value: Any) -> str:
+    normalized = _non_empty_text(name, value)
+    if len(normalized) != 64:
+        raise ValueError(f"{name} must be a SHA-256 digest")
+    try:
+        int(normalized, 16)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a SHA-256 digest") from error
+    return normalized.lower()
 
 
 def _final_status(

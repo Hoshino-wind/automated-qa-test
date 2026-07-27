@@ -514,7 +514,7 @@ def run_probe_redaction_fixture(script_dir: Path, tmp_path: Path) -> None:
                             "command": [
                                 "python3",
                                 "-c",
-                                "import os,sys; label='pass'+'word'; one=os.environ['QA_REDACT_ONE']; two=os.environ['QA_REDACT_TWO']; three=os.environ['QA_REDACT_THREE']; print(label+'='+one); print('https://example.test/callback?'+label+'='+one+'&ok=1'); print('Cook'+'ie: '+'s'+'id='+two+'; theme=light', file=sys.stderr); print('Author'+'ization: Basic '+three, file=sys.stderr)",
+                                "import sys; label='pass'+'word'; one='fixture-'+'pass'+'word'; two='fixture-'+'session'; three='fixture-'+'basic'; print(label+'='+one); print('https://example.test/callback?'+label+'='+one+'&ok=1'); print('Cook'+'ie: '+'s'+'id='+two+'; theme=light', file=sys.stderr); print('Author'+'ization: Basic '+three, file=sys.stderr)",
                             ],
                             "captureStdout": True,
                             "captureStderr": True,
@@ -526,12 +526,7 @@ def run_probe_redaction_fixture(script_dir: Path, tmp_path: Path) -> None:
             ],
         },
     )
-    redaction_env = {
-        **os.environ,
-        "QA_REDACT_ONE": "fixture-password",
-        "QA_REDACT_TWO": "fixture-session",
-        "QA_REDACT_THREE": "fixture-basic",
-    }
+    redaction_env = dict(os.environ)
     run_cmd(
         [
             sys.executable,
@@ -4868,7 +4863,7 @@ def run_environment_boundary_fixture(script_dir: Path, tmp_path: Path) -> None:
         },
     )
     write_json(cycle_dir / "adapter-context.json", unconfirmed_context)
-    run_cmd(
+    cycle_proc = subprocess.run(
         [
             sys.executable,
             str(script_dir / "run_qa_cycle.py"),
@@ -4884,10 +4879,27 @@ def run_environment_boundary_fixture(script_dir: Path, tmp_path: Path) -> None:
             "test database with local seed data; no production data",
         ],
         cwd=cycle_dir,
+        text=True,
+        capture_output=True,
     )
     cycle_verdict = load_json(cycle_dir / "qa-verdict.json")
     cycle_context = load_json(cycle_dir / "adapter-context.json")
-    assert_true(cycle_verdict.get("can_claim_pass") is True, "run_qa_cycle should pass through confirmed environment boundary.")
+    assert_true(
+        cycle_proc.returncode != 0,
+        "--skip-probe must remain handoff-only even when historical results and the environment boundary are valid.",
+    )
+    assert_true(
+        cycle_verdict.get("can_claim_pass") is False,
+        "Historical results supplied through --skip-probe must not unlock a current proof-carrying pass.",
+    )
+    assert_true(
+        "current_probe_required"
+        in {
+            reason.get("code")
+            for reason in cycle_verdict.get("reasons", [])
+        },
+        "The skip-probe handoff should explain that current dispatch proof is required.",
+    )
     assert_true(cycle_context.get("environment_boundary", {}).get("runtime_mode") == "local", "run_qa_cycle should write runtime mode to adapter-context.json.")
     assert_true("test database" in cycle_context.get("environment_boundary", {}).get("data_boundary_status", ""), "run_qa_cycle should write data boundary to adapter-context.json.")
 
@@ -5189,13 +5201,13 @@ print(json.dumps(data, ensure_ascii=False))
                                 "testIds": ["T-session-api"],
                                 "requirementIds": ["R-session-api"],
                                 "method": "GET",
-                                "path": {"var": "session_id", "prefix": "/api/v1/sessions/"},
+                                "path": f"/api/v1/sessions/{session_id}",
                                 "expectStatus": 200,
-                                "expectResponseTextContains": {"var": "qa_marker"},
+                                "expectResponseTextContains": marker,
                                 "expectJson": {
-                                    "id": {"var": "session_id"},
+                                    "id": session_id,
                                     "status": "completed",
-                                    "messages[1].content": {"op": "contains", "value": {"var": "qa_marker"}},
+                                    "messages[1].content": {"op": "contains", "value": marker},
                                 },
                                 "captureBody": True,
                                 "evidenceType": "api_response",
@@ -5212,15 +5224,15 @@ print(json.dumps(data, ensure_ascii=False))
                                     "--store",
                                     str(store_path),
                                     "--turn-id",
-                                    {"var": "turn_id"},
+                                    turn_id,
                                 ],
                                 "expectExitCode": 0,
                                 "expectStdoutContains": "completed",
                                 "expectStdoutJson": {
-                                    "turn_id": {"var": "turn_id"},
+                                    "turn_id": turn_id,
                                     "status": "completed",
                                     "message_count": {"op": "gte", "value": 2},
-                                    "answer": {"op": "contains", "value": {"var": "qa_marker"}},
+                                    "answer": {"op": "contains", "value": marker},
                                 },
                                 "extractStdoutJson": {"session_id": "session_id", "turn_id_from_store": "turn_id"},
                                 "captureStdout": True,

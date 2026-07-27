@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Self
@@ -70,6 +70,28 @@ _CRITIC_FIELDS = frozenset(
         "findings",
     },
 )
+_DIAGNOSIS_FIELDS = frozenset(
+    {
+        "diagnosis_id",
+        "plan_sha256",
+        "context_sha256",
+        "state_sha256",
+        "tool_registry_sha256",
+        "trace_sha256",
+        "model_id",
+        "findings",
+        "unknowns",
+    },
+)
+_DIAGNOSIS_FINDING_FIELDS = frozenset(
+    {
+        "hypothesis_id",
+        "status",
+        "explanation",
+        "evidence_refs",
+        "recommended_probe_ids",
+    },
+)
 
 
 class AgentContractError(ValueError):
@@ -104,6 +126,14 @@ class CriticRecommendation(StrEnum):
     ACCEPT = "accept"
     REVISE = "revise"
     STOP = "stop"
+
+
+class DiagnosisStatus(StrEnum):
+    """Diagnostician 对既有假设的受约束状态更新。"""
+
+    SUPPORTED = "supported"
+    REFUTED = "refuted"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,8 +451,10 @@ class PlanProposal:
         value: Mapping[str, Any],
         *,
         registry: ToolRegistry,
+        expected_model_id: str,
+        allowed_evidence_refs: Iterable[str],
     ) -> Self:
-        """严格解析完整模型计划，并绑定当前 Tool Registry。"""
+        """严格解析计划并绑定 Registry、模型与可信来源集合。"""
 
         payload = _model_object(
             value,
@@ -477,7 +509,7 @@ class PlanProposal:
             )
             for index, item in enumerate(probes_value)
         )
-        return cls(
+        proposal = cls(
             proposal_id=payload["proposal_id"],
             context_sha256=payload["context_sha256"],
             state_sha256=payload["state_sha256"],
@@ -492,6 +524,63 @@ class PlanProposal:
             ),
             probes=probes,
         )
+        expected_model = _text(
+            "expected_model_id",
+            expected_model_id,
+        )
+        if proposal.model_id != expected_model:
+            raise AgentContractError(
+                "proposal_model_id_drift",
+                "模型计划的 model_id 与受信调用边界不一致",
+                path="$.proposal.model_id",
+            )
+        allowed_refs = _trusted_evidence_refs(
+            allowed_evidence_refs,
+            path="$.allowed_evidence_refs",
+        )
+        _require_evidence_subset(
+            proposal.evidence_refs,
+            allowed=allowed_refs,
+            path="$.proposal.evidence_refs",
+        )
+        declared_refs = frozenset(proposal.evidence_refs)
+        if not declared_refs:
+            raise AgentContractError(
+                "proposal_evidence_missing",
+                "PlanProposal 至少需要一个受信证据引用",
+                path="$.proposal.evidence_refs",
+            )
+        for index, hypothesis in enumerate(proposal.hypotheses):
+            if not hypothesis.evidence_refs:
+                raise AgentContractError(
+                    "hypothesis_evidence_missing",
+                    "每个 hypothesis 至少需要一个受信证据引用",
+                    path=(
+                        "$.proposal.hypotheses"
+                        f"[{index}].evidence_refs"
+                    ),
+                )
+            _require_evidence_subset(
+                hypothesis.evidence_refs,
+                allowed=declared_refs,
+                path=(
+                    "$.proposal.hypotheses"
+                    f"[{index}].evidence_refs"
+                ),
+            )
+        for index, probe in enumerate(proposal.probes):
+            if not probe.evidence_refs:
+                raise AgentContractError(
+                    "probe_evidence_missing",
+                    "每个 probe 至少需要一个受信证据引用",
+                    path=f"$.proposal.probes[{index}].evidence_refs",
+                )
+            _require_evidence_subset(
+                probe.evidence_refs,
+                allowed=declared_refs,
+                path=f"$.proposal.probes[{index}].evidence_refs",
+            )
+        return proposal
 
     @property
     def canonical_sha256(self) -> str:
@@ -514,6 +603,9 @@ class PlanProposal:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": 1,
+            "kind": "qa_plan_proposal",
+            "not_authorization": True,
             "proposal_id": self.proposal_id,
             "context_sha256": self.context_sha256,
             "state_sha256": self.state_sha256,
@@ -637,9 +729,19 @@ class CriticReview:
     def from_model_input(
         cls,
         value: Mapping[str, Any],
+        *,
+        plan: PlanProposal,
+        expected_model_id: str,
+        allowed_evidence_refs: Iterable[str],
     ) -> Self:
-        """严格解析 Critic 建议并拒绝授权字段。"""
+        """解析 Critic 建议并绑定当前计划、模型与证据集合。"""
 
+        if not isinstance(plan, PlanProposal):
+            raise AgentContractError(
+                "critic_plan_invalid",
+                "plan 必须是 PlanProposal",
+                path="$.plan",
+            )
         payload = _model_object(
             value,
             allowed=_CRITIC_FIELDS,
@@ -648,7 +750,29 @@ class CriticReview:
             missing_code="critic_fields_missing",
             path="$.critic",
         )
-        return cls(
+        bindings = {
+            "plan_sha256": plan.canonical_sha256,
+            "context_sha256": plan.context_sha256,
+            "state_sha256": plan.state_sha256,
+            "tool_registry_sha256": plan.tool_registry_sha256,
+        }
+        for field_name, expected in bindings.items():
+            if _sha256(field_name, payload[field_name]) != expected:
+                raise AgentContractError(
+                    "critic_binding_drift",
+                    f"critic 的 {field_name} 与当前计划不一致",
+                    path=f"$.critic.{field_name}",
+                )
+        if _text("model_id", payload["model_id"]) != _text(
+            "expected_model_id",
+            expected_model_id,
+        ):
+            raise AgentContractError(
+                "critic_model_id_drift",
+                "critic model_id 与受信调用边界不一致",
+                path="$.critic.model_id",
+            )
+        review = cls(
             review_id=payload["review_id"],
             plan_sha256=payload["plan_sha256"],
             context_sha256=payload["context_sha256"],
@@ -674,6 +798,31 @@ class CriticReview:
                 path="$.critic.findings",
             ),
         )
+        unknown_hypotheses = sorted(
+            set(review.hypothesis_ids)
+            - {
+                hypothesis.hypothesis_id
+                for hypothesis in plan.hypotheses
+            }
+        )
+        if unknown_hypotheses:
+            raise AgentContractError(
+                "critic_hypothesis_unknown",
+                (
+                    "critic 引用了未知假设："
+                    + ", ".join(unknown_hypotheses)
+                ),
+                path="$.critic.hypothesis_ids",
+            )
+        _require_evidence_subset(
+            review.evidence_refs,
+            allowed=_trusted_evidence_refs(
+                allowed_evidence_refs,
+                path="$.allowed_evidence_refs",
+            ),
+            path="$.critic.evidence_refs",
+        )
+        return review
 
     @property
     def canonical_sha256(self) -> str:
@@ -681,6 +830,9 @@ class CriticReview:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": 1,
+            "kind": "qa_critic_review",
+            "not_authorization": True,
             "review_id": self.review_id,
             "plan_sha256": self.plan_sha256,
             "context_sha256": self.context_sha256,
@@ -691,6 +843,317 @@ class CriticReview:
             "hypothesis_ids": list(self.hypothesis_ids),
             "evidence_refs": list(self.evidence_refs),
             "findings": list(self.findings),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosisFinding:
+    """只引用既有假设/探针和观察证据的诊断结论。"""
+
+    hypothesis_id: str
+    status: DiagnosisStatus | str
+    explanation: str
+    evidence_refs: tuple[str, ...]
+    recommended_probe_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "hypothesis_id",
+            _text("hypothesis_id", self.hypothesis_id),
+        )
+        try:
+            normalized_status = DiagnosisStatus(self.status)
+        except (TypeError, ValueError) as exc:
+            raise AgentContractError(
+                "diagnosis_status_invalid",
+                "status 必须是 supported、refuted 或 unknown",
+                path="$.status",
+            ) from exc
+        object.__setattr__(self, "status", normalized_status)
+        object.__setattr__(
+            self,
+            "explanation",
+            _text("explanation", self.explanation),
+        )
+        evidence_refs = _text_tuple(
+            "evidence_refs",
+            self.evidence_refs,
+        )
+        if not evidence_refs:
+            raise AgentContractError(
+                "diagnosis_evidence_missing",
+                "每条 diagnosis finding 至少需要一个观察证据引用",
+                path="$.evidence_refs",
+            )
+        object.__setattr__(self, "evidence_refs", evidence_refs)
+        object.__setattr__(
+            self,
+            "recommended_probe_ids",
+            _text_tuple(
+                "recommended_probe_ids",
+                self.recommended_probe_ids,
+            ),
+        )
+
+    @classmethod
+    def from_model_input(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        path: str,
+    ) -> Self:
+        payload = _model_object(
+            value,
+            allowed=_DIAGNOSIS_FINDING_FIELDS,
+            required=_DIAGNOSIS_FINDING_FIELDS,
+            unknown_code="diagnosis_finding_fields_unknown",
+            missing_code="diagnosis_finding_fields_missing",
+            path=path,
+        )
+        return cls(
+            hypothesis_id=payload["hypothesis_id"],
+            status=payload["status"],
+            explanation=payload["explanation"],
+            evidence_refs=_model_text_array(
+                payload["evidence_refs"],
+                name="evidence_refs",
+                path=f"{path}.evidence_refs",
+            ),
+            recommended_probe_ids=_model_text_array(
+                payload["recommended_probe_ids"],
+                name="recommended_probe_ids",
+                path=f"{path}.recommended_probe_ids",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "status": self.status.value,
+            "explanation": self.explanation,
+            "evidence_refs": list(self.evidence_refs),
+            "recommended_probe_ids": list(
+                self.recommended_probe_ids
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosisProposal:
+    """绑定当前 plan/state/trace 的诊断建议，不携带工具调用或授权。"""
+
+    diagnosis_id: str
+    plan_sha256: str
+    context_sha256: str
+    state_sha256: str
+    tool_registry_sha256: str
+    trace_sha256: str
+    model_id: str
+    findings: tuple[DiagnosisFinding, ...]
+    unknowns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "diagnosis_id",
+            _text("diagnosis_id", self.diagnosis_id),
+        )
+        for field_name in (
+            "plan_sha256",
+            "context_sha256",
+            "state_sha256",
+            "tool_registry_sha256",
+            "trace_sha256",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _sha256(field_name, getattr(self, field_name)),
+            )
+        object.__setattr__(
+            self,
+            "model_id",
+            _text("model_id", self.model_id),
+        )
+        findings = tuple(self.findings)
+        if not findings or any(
+            not isinstance(item, DiagnosisFinding)
+            for item in findings
+        ):
+            raise AgentContractError(
+                "diagnosis_findings_invalid",
+                "DiagnosisProposal 至少需要一条 DiagnosisFinding",
+                path="$.findings",
+            )
+        _unique_ids(
+            "hypothesis_id",
+            [item.hypothesis_id for item in findings],
+            path="$.findings",
+        )
+        object.__setattr__(self, "findings", findings)
+        object.__setattr__(
+            self,
+            "unknowns",
+            _text_tuple("unknowns", self.unknowns),
+        )
+
+    @classmethod
+    def from_model_input(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        plan: PlanProposal,
+        expected_trace_sha256: str,
+        expected_model_id: str,
+        allowed_evidence_refs: Iterable[str],
+    ) -> Self:
+        """解析诊断并证明它只引用当前计划中的假设和探针。"""
+
+        if not isinstance(plan, PlanProposal):
+            raise AgentContractError(
+                "diagnosis_plan_invalid",
+                "plan 必须是 PlanProposal",
+                path="$.plan",
+            )
+        payload = _model_object(
+            value,
+            allowed=_DIAGNOSIS_FIELDS,
+            required=_DIAGNOSIS_FIELDS,
+            unknown_code="diagnosis_fields_unknown",
+            missing_code="diagnosis_fields_missing",
+            path="$.diagnosis",
+        )
+        bindings = {
+            "plan_sha256": plan.canonical_sha256,
+            "context_sha256": plan.context_sha256,
+            "state_sha256": plan.state_sha256,
+            "tool_registry_sha256": plan.tool_registry_sha256,
+            "trace_sha256": _sha256(
+                "expected_trace_sha256",
+                expected_trace_sha256,
+            ),
+        }
+        for field_name, expected in bindings.items():
+            if _sha256(field_name, payload[field_name]) != expected:
+                raise AgentContractError(
+                    "diagnosis_binding_drift",
+                    f"diagnosis 的 {field_name} 与当前计划不一致",
+                    path=f"$.diagnosis.{field_name}",
+                )
+        if _text("model_id", payload["model_id"]) != _text(
+            "expected_model_id",
+            expected_model_id,
+        ):
+            raise AgentContractError(
+                "diagnosis_model_id_drift",
+                "diagnosis model_id 与受信调用边界不一致",
+                path="$.diagnosis.model_id",
+            )
+        findings_value = payload["findings"]
+        if not isinstance(findings_value, list):
+            raise AgentContractError(
+                "diagnosis_findings_invalid",
+                "findings 必须是 JSON array",
+                path="$.diagnosis.findings",
+            )
+        findings = tuple(
+            DiagnosisFinding.from_model_input(
+                item,
+                path=f"$.diagnosis.findings[{index}]",
+            )
+            for index, item in enumerate(findings_value)
+        )
+        known_hypotheses = {
+            item.hypothesis_id for item in plan.hypotheses
+        }
+        probes = {
+            item.probe_id: item for item in plan.probes
+        }
+        allowed_refs = _trusted_evidence_refs(
+            allowed_evidence_refs,
+            path="$.allowed_evidence_refs",
+        )
+        for index, finding in enumerate(findings):
+            if finding.hypothesis_id not in known_hypotheses:
+                raise AgentContractError(
+                    "diagnosis_hypothesis_unknown",
+                    (
+                        "diagnosis 引用了未知假设："
+                        f"{finding.hypothesis_id}"
+                    ),
+                    path=(
+                        f"$.diagnosis.findings[{index}].hypothesis_id"
+                    ),
+                )
+            for probe_id in finding.recommended_probe_ids:
+                probe = probes.get(probe_id)
+                if probe is None:
+                    raise AgentContractError(
+                        "diagnosis_probe_unknown",
+                        f"diagnosis 引用了未知探针：{probe_id}",
+                        path=(
+                            "$.diagnosis.findings"
+                            f"[{index}].recommended_probe_ids"
+                        ),
+                    )
+                if finding.hypothesis_id not in probe.hypothesis_ids:
+                    raise AgentContractError(
+                        "diagnosis_probe_hypothesis_mismatch",
+                        (
+                            f"探针 {probe_id} 未绑定假设 "
+                            f"{finding.hypothesis_id}"
+                        ),
+                        path=(
+                            "$.diagnosis.findings"
+                            f"[{index}].recommended_probe_ids"
+                        ),
+                    )
+            _require_evidence_subset(
+                finding.evidence_refs,
+                allowed=allowed_refs,
+                path=(
+                    f"$.diagnosis.findings[{index}].evidence_refs"
+                ),
+            )
+        return cls(
+            diagnosis_id=payload["diagnosis_id"],
+            plan_sha256=payload["plan_sha256"],
+            context_sha256=payload["context_sha256"],
+            state_sha256=payload["state_sha256"],
+            tool_registry_sha256=payload[
+                "tool_registry_sha256"
+            ],
+            trace_sha256=payload["trace_sha256"],
+            model_id=payload["model_id"],
+            findings=findings,
+            unknowns=_model_text_array(
+                payload["unknowns"],
+                name="unknowns",
+                path="$.diagnosis.unknowns",
+            ),
+        )
+
+    @property
+    def canonical_sha256(self) -> str:
+        return _canonical_sha256(self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "kind": "qa_diagnosis_proposal",
+            "not_authorization": True,
+            "diagnosis_id": self.diagnosis_id,
+            "plan_sha256": self.plan_sha256,
+            "context_sha256": self.context_sha256,
+            "state_sha256": self.state_sha256,
+            "tool_registry_sha256": self.tool_registry_sha256,
+            "trace_sha256": self.trace_sha256,
+            "model_id": self.model_id,
+            "findings": [
+                item.to_dict() for item in self.findings
+            ],
+            "unknowns": list(self.unknowns),
         }
 
 
@@ -837,6 +1300,52 @@ def _model_text_array(
             path=path,
         )
     return _text_tuple(name, tuple(value))
+
+
+def _trusted_evidence_refs(
+    values: Iterable[str],
+    *,
+    path: str,
+) -> frozenset[str]:
+    if isinstance(values, (str, bytes)):
+        raise AgentContractError(
+            "evidence_allowlist_invalid",
+            "allowed_evidence_refs 必须是字符串集合",
+            path=path,
+        )
+    try:
+        normalized = _text_tuple(
+            "allowed_evidence_refs",
+            tuple(values),
+        )
+    except TypeError as exc:
+        raise AgentContractError(
+            "evidence_allowlist_invalid",
+            "allowed_evidence_refs 必须是字符串集合",
+            path=path,
+        ) from exc
+    if not normalized:
+        raise AgentContractError(
+            "evidence_allowlist_empty",
+            "allowed_evidence_refs 不得为空",
+            path=path,
+        )
+    return frozenset(normalized)
+
+
+def _require_evidence_subset(
+    values: Iterable[str],
+    *,
+    allowed: frozenset[str],
+    path: str,
+) -> None:
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise AgentContractError(
+            "evidence_ref_untrusted",
+            "模型引用了未注入的证据来源：" + ", ".join(unknown),
+            path=path,
+        )
 
 
 def _unique_ids(

@@ -2,12 +2,65 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { constants as fsConstants } from "node:fs";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+
+const NO_HUMAN_AUTHORIZATION_SHA256 = createHash("sha256")
+  .update("qa-human-authorization:not-configured:v1", "utf-8")
+  .digest("hex");
+const MAX_TRUSTED_INPUT_BYTES = 4 * 1024 * 1024;
+
+async function readStableJsonInput(inputPath, label) {
+  const resolved = path.resolve(inputPath);
+  const flags = fsConstants.O_RDONLY |
+    fsConstants.O_CLOEXEC |
+    (fsConstants.O_NOFOLLOW || 0);
+  const handle = await fs.open(resolved, flags);
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.nlink !== 1 ||
+        before.size > MAX_TRUSTED_INPUT_BYTES) {
+      throw new Error(
+        `${label} must be a bounded single-link regular file.`,
+      );
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat();
+    const current = await fs.lstat(resolved);
+    if (before.dev !== after.dev || before.ino !== after.ino ||
+        before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs ||
+        current.dev !== before.dev || current.ino !== before.ino ||
+        current.size !== before.size ||
+        current.mtimeMs !== before.mtimeMs) {
+      throw new Error(`${label} changed while being read.`);
+    }
+    let value;
+    try {
+      value = JSON.parse(bytes.toString("utf-8"));
+    } catch (error) {
+      throw new Error(
+        `${label} is not valid JSON: ${error.message || String(error)}`,
+      );
+    }
+    if (!isObject(value)) {
+      throw new Error(`${label} root must be an object.`);
+    }
+    return {
+      path: resolved,
+      bytes,
+      value,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  } finally {
+    await handle.close();
+  }
+}
 
 function usage() {
-  console.log("Usage: playwright_probe.mjs --plan <test-plan.json> [--plan-audit-summary <plan-audit-summary.json>]");
+  console.log("Usage: playwright_probe.mjs --plan <test-plan.json> [--plan-audit-summary <plan-audit-summary.json>] [--agent-context <agent-context.json> --action-contracts <action-contracts.json> --action-journal <action-journal.jsonl>]");
 }
 
 function argValue(name) {
@@ -95,8 +148,48 @@ async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true });
 }
 
+const sensitiveResolvedValues = new Set();
+const sensitiveEnvironmentNames = new Set();
+
+function registerSensitiveResolvedValue(value) {
+  if (value === undefined || value === null) return;
+  if (Array.isArray(value)) {
+    for (const item of value) registerSensitiveResolvedValue(item);
+    return;
+  }
+  if (isObject(value)) {
+    for (const item of Object.values(value)) registerSensitiveResolvedValue(item);
+    return;
+  }
+  const text = String(value);
+  if (text) sensitiveResolvedValues.add(text);
+}
+
+function redactResolvedSecrets(value) {
+  let text = String(value);
+  const ordered = [...sensitiveResolvedValues].sort((left, right) => right.length - left.length);
+  for (const secret of ordered) {
+    if (!secret) continue;
+    if (text === secret) return "[REDACTED]";
+    if (secret.length >= 4) {
+      text = text.split(secret).join("[REDACTED]");
+      continue;
+    }
+    const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const bounded = new RegExp(
+      `(^|[\\s"'=:,;\\[\\]{}()])${escaped}(?=$|[\\s"',:;\\[\\]{}()])`,
+      "g",
+    );
+    text = text.replace(
+      bounded,
+      (_match, prefix) => `${prefix}[REDACTED]`,
+    );
+  }
+  return text;
+}
+
 function redactString(value) {
-  return String(value)
+  return redactResolvedSecrets(value)
     .replace(/\b(Authorization|Cookie|Set-Cookie)\s*:\s*[^\r\n]+/gi, "$1: [REDACTED]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{16,}/gi, "Bearer [REDACTED]")
     .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED_JWT]")
@@ -142,67 +235,1650 @@ async function sha256File(file) {
   return createHash("sha256").update(content).digest("hex");
 }
 
-async function validateCommandPlanBinding(plan, planPath, auditPath) {
+function canonicalJson(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Canonical JSON rejects non-finite numbers.");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (isObject(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  throw new Error(`Unsupported canonical JSON value: ${typeof value}`);
+}
+
+function canonicalSha256(value) {
+  return createHash("sha256").update(canonicalJson(value), "utf-8").digest("hex");
+}
+
+const RESOLUTION_POLICY = Object.freeze({
+  schema_version: 4,
+  kind: "qa_runtime_reference_resolution_policy",
+  reference_kinds: ["env", "template", "var"],
+  strict_closed_reference_objects: true,
+  mutually_exclusive_reference_kinds: true,
+  immutable_identity_fields: ["scenario.id", "step.action", "step.id"],
+  forbidden_dynamic_command_fields: [
+    "step.cmd",
+    "step.command",
+    "step.cwd",
+    "step.env",
+    "step.shell",
+  ],
+  forbidden_dynamic_high_risk_network_target_fields: [
+    "plan.baseUrl",
+    "step.method",
+    "step.path",
+    "step.pathTemplate",
+    "step.url",
+    "step.urlTemplate",
+  ],
+  high_risk_network_redirects_followed: false,
+  high_risk_target_identity_binding: "static_scheme_host_port_path_method",
+  high_risk_dynamic_values: "credential_headers_only",
+  high_risk_absolute_http_target_required: true,
+  high_risk_routing_overrides_forbidden: true,
+  resolved_command_boundary_revalidation: true,
+  command_default_cwd: "plan_directory",
+  command_environment_binding: "allowlisted_exact_sha256",
+  command_executable_binding:
+    "real_absolute_single_link_regular_identity_sha256",
+  command_direct_file_binding:
+    "existing_argv_regular_files_identity_sha256",
+  command_spawn_uses_bound_real_paths: true,
+  resolved_values_persisted: false,
+  persistent_commitment_mode: "structured_secret_redacted",
+  dynamic_reference_values_persisted: false,
+  low_entropy_secret_hashes_persisted: false,
+  raw_reference_identity_preserved: true,
+});
+const RESOLUTION_POLICY_SHA256 = canonicalSha256(RESOLUTION_POLICY);
+const ACTION_AUTHORITY_KEY_ENV = "QA_ACTION_AUTHORITY_KEY";
+const ACTION_AUTHORIZATION_TICKET_ENV = "QA_ACTION_AUTHORIZATION_TICKET";
+const TRUSTED_TOOL_REGISTRY_SHA256 = "2a3cd3aab0aaeab972309b344d9e08de0ac996f00aebb6f626327ab87b85c66a";
+const TRUSTED_TOOL_SPEC_ROWS = [
+  ["addCookies", "40c3931b1420f7d13ad3b304b166ec4bc58e34e68009d4f5e47dd7309cb625a0", "medium", false, 60, 262144, ["browser_state_write", "isolated_test_environment"]],
+  ["api", "3f04e9c975a24aebdf47bf99d72f4e7f19318dddaf3fe45c9995cae1a5a8f144", "high", false, 120, 262144, ["isolated_test_environment", "network_request"]],
+  ["cleanupApi", "a2dc5843b4e16a346347d76738f627a94e1c2ca8c55271cd2e3c9bcb7a33958a", "high", true, 120, 262144, ["cleanup_execution", "isolated_test_environment", "network_request"]],
+  ["click", "3143be081ba3279a0ee585f65b057b0855bd4306123a828805ec1b5773c009a1", "medium", false, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["clickAndWaitForResponse", "5deb4971abdc4c24254f8270a980bccb32430a1aab20f03bf61a7c867023caa7", "medium", false, 120, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["clickRole", "09b9fdf824e243343579b6919f46e225531642e71da84ff94bd708bf3c9497db", "medium", false, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["clickText", "b4f5a0cba4c7280c5fd5d7868d9a96eb227796b0172e45fe9815b6f239cbdbe1", "medium", false, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["command", "19ba70f9c4a1c090510b5988b7823d98d8753b7e8f47198a1218f25017a8515a", "high", false, 300, 1048576, ["command_execution", "isolated_test_environment"]],
+  ["dismissIfPresent", "94132d069d550e793074eba58e52e063157ee4f9564e214874d4de8a4eadc33a", "medium", true, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["expectAnyText", "46588b8d9f9dc61cc159cf8444b3eacc4f1b3c7a11b31d0691623b72be2c214a", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectClickable", "9312bb835de405d971a161ba296854a0a1657ff86fc1505683cab743c9832bd3", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectHidden", "4aa9d7145d63ac76086585940f9033298915413709df24b63380b18be579fd63", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectLocatorCount", "2fb1b72349ae4b6ad3d4a1b110c372e7e8bbe8caddbc959f4f4931f98ac71599", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectNoConsoleErrors", "e046deeaf6e33141f0376d8c2164dea45c4f17618d142d22c9db35f04742df88", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectNoFailedResponses", "9dde62f3ac711f54c3ab4c24a1a67f1f167fa2bccf02968509a6551c339b0eec", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectNoRequest", "bd50a05ddba7586ba565aa0a516603c9788cce802c2ee29f4e60162f15b31f59", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectNoRequestFailures", "2546244f90cebf416f01a37673f9b79848a9cb7d9fc8d135d17c280a6185d6a4", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectText", "0217f84fdc6def12f7997ef4bb965ca3bafcd3389f69c41c41642639134f01f8", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectUrlContains", "0ec7a2cdce4b6737b4d62056052cd4c4db4dd889fdc56c2b31af901cd5bcc6e7", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["expectVisible", "92c37786478001f3bd516e09699d319616f38488d9c020de437c33012492fc0a", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["fill", "caf7cf68f65cfbdbfe05c4b86cc3e4ac0aac82f3d7a96c17d2a608665a4dac81", "medium", true, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["fillLabel", "a2c25541bc29006bd4938f34e61e05fc62db3dd05ef6987996ef72299079f454", "medium", true, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["fillPlaceholder", "d8831fa2ca1795b2957201a635dcffdd281d71f229aad9c39b47e9988420d35c", "medium", true, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["goto", "067f930c6800f0916288aca072684f2466612fb86203cead3260da12106f5a7b", "low", true, 120, 262144, ["isolated_test_environment"]],
+  ["pollApi", "058f60c5afeca435b348111de6976dd3a285515effd10b488f2a308242b33546", "high", false, 180, 262144, ["isolated_test_environment", "network_request"]],
+  ["press", "f32be907c28c84949c6bc3149eeaa1b184febd39dfc1203dd76141642b321940", "medium", false, 60, 262144, ["browser_interaction", "isolated_test_environment"]],
+  ["screenshot", "ebfb70078479265c01aceccac3b108a281e44da171fddd37d2433c9d09d60e7b", "low", true, 60, 5242880, ["isolated_test_environment"]],
+  ["setLocalStorage", "291b2d64d87a5edd5a1ef98142c74c79a01a8ef0073b596fef4d0b08741aec5c", "medium", false, 60, 262144, ["browser_state_write", "isolated_test_environment"]],
+  ["sse", "76ae32cb2e4acb2f7f3d912f5f488c7675d7b0bd3c49dde159371e9fbaeb2396", "medium", true, 180, 262144, ["isolated_test_environment", "network_request"]],
+  ["wait", "7005a8232a5bcc4026dcffef389ffd763acf028656814c0821a4e50fc4fa311c", "low", true, 60, 262144, ["isolated_test_environment"]],
+  ["waitForLoadState", "4a0abc88fe9e3756430de791e19f43c71bad78f10d0839ec83133142253010a7", "low", true, 120, 262144, ["isolated_test_environment"]],
+  ["waitForResponse", "efeddddc66a7ce5aec77c4cf548d5a60cdc60f4cd50c2e8856d56df0d8ccf89f", "low", true, 120, 262144, ["isolated_test_environment"]],
+  ["websocket", "69e33ad2374e934333bbb0c78c27363d6f3bb9e9e0f1128c3f8a2c1ce40a957f", "medium", false, 180, 262144, ["isolated_test_environment", "network_request"]],
+];
+const TRUSTED_TOOL_SPECS = new Map(
+  TRUSTED_TOOL_SPEC_ROWS.map(
+    ([action, specSha256, riskClass, idempotent, maxTimeoutSeconds, outputLimitBytes, requiredAuthorizations]) => [
+      action,
+      {
+        version: "runner-action@1",
+        specSha256,
+        riskClass,
+        idempotent,
+        maxTimeoutSeconds,
+        outputLimitBytes,
+        requiredAuthorizations,
+      },
+    ],
+  ),
+);
+
+function invocationCommitmentSha256(resolvedInvocationSha256) {
+  return canonicalSha256({
+    schema_version: 1,
+    kind: "qa_secret_redacted_invocation_commitment",
+    resolved_invocation_sha256: resolvedInvocationSha256,
+  });
+}
+
+function actionAuthorizationTicketPayload(contracts) {
+  return {
+    schema_version: 1,
+    kind: "qa_action_authorization_ticket",
+    run_id: contracts.run_id,
+    generation: contracts.generation,
+    iteration: contracts.iteration,
+    plan_sha256: contracts.plan_sha256,
+    context_sha256: contracts.context_sha256,
+    plan_audit_sha256: contracts.plan_audit_sha256,
+    tool_registry_sha256: contracts.tool_registry_sha256,
+    human_authorization_sha256: contracts.human_authorization_sha256,
+    contracts_sha256: contracts.contracts_sha256,
+    resolution_policy_sha256: RESOLUTION_POLICY_SHA256,
+    action_authorization_sha256: contracts.actions.map(
+      (item) => item.authorization_sha256,
+    ),
+  };
+}
+
+function consumeActionAuthorizationTicket(contracts) {
+  const keyHex = process.env[ACTION_AUTHORITY_KEY_ENV] || "";
+  const ticket = process.env[ACTION_AUTHORIZATION_TICKET_ENV] || "";
+  delete process.env[ACTION_AUTHORITY_KEY_ENV];
+  delete process.env[ACTION_AUTHORIZATION_TICKET_ENV];
+  if (!/^[0-9a-f]{64,}$/.test(keyHex) ||
+      !/^[0-9a-f]{64}$/.test(ticket)) {
+    throw new Error(
+      "Action dispatch requires an ephemeral trusted authorization ticket.",
+    );
+  }
+  const expected = createHmac(
+    "sha256",
+    Buffer.from(keyHex, "hex"),
+  ).update(
+    canonicalJson(actionAuthorizationTicketPayload(contracts)),
+    "utf-8",
+  ).digest("hex");
+  const expectedBytes = Buffer.from(expected, "hex");
+  const ticketBytes = Buffer.from(ticket, "hex");
+  if (expectedBytes.length !== ticketBytes.length ||
+      !timingSafeEqual(expectedBytes, ticketBytes)) {
+    throw new Error(
+      "Action authorization ticket does not bind the current contract/context/audit.",
+    );
+  }
+  return canonicalSha256({
+    schema_version: 1,
+    kind: "qa_action_authorization_ticket_binding",
+    ticket,
+  });
+}
+
+function executionAuthorizationSha256(contract, event) {
+  return canonicalSha256({
+    schema_version: 1,
+    kind: "qa_execution_authorization",
+    run_id: event.run_id,
+    generation: event.generation,
+    iteration: event.iteration,
+    scenario_id: event.scenario_id,
+    step_id: event.step_id,
+    action: event.action,
+    raw_step_sha256: event.raw_step_sha256,
+    resolution_policy_sha256: event.resolution_policy_sha256,
+    resolved_invocation_sha256: event.resolved_invocation_sha256,
+    invocation_sha256: event.invocation_sha256,
+    execution_controls_sha256: event.execution_controls_sha256,
+    authorization_ticket_sha256: event.authorization_ticket_sha256,
+    human_authorization_sha256: event.human_authorization_sha256,
+    tool_spec_sha256: event.tool_spec_sha256,
+    contract_authorization_sha256: contract.authorization_sha256,
+  });
+}
+
+class DurableActionJournal {
+  constructor(
+    journalPath,
+    contracts,
+    events,
+    handle,
+    authorizationTicketSha256,
+    openedIdentity,
+  ) {
+    this.path = journalPath;
+    this.contracts = contracts;
+    this.events = events;
+    this.handle = handle;
+    this.authorizationTicketSha256 = authorizationTicketSha256;
+    this.openedIdentity = openedIdentity;
+    this.previousHash = events.length ? events[events.length - 1].event_sha256 : null;
+    this.nextSequence = events.length + 1;
+    this.contractByIdentity = new Map(
+      contracts.actions.map((item) => [`${item.scenario_id}\u0000${item.step_id}`, item]),
+    );
+  }
+
+  static async open(
+    journalPath,
+    contractsPath,
+    planInput,
+    planAuditInput,
+    contextInput,
+  ) {
+    if (path.resolve(journalPath) === path.resolve(contractsPath) ||
+        path.resolve(journalPath) === planInput.path) {
+      throw new Error("Action journal output must not alias plan or contracts input.");
+    }
+    const contractsInput = await readStableJsonInput(
+      contractsPath,
+      "action contracts",
+    );
+    const contracts = contractsInput.value;
+    const unsigned = { ...contracts };
+    delete unsigned.contracts_sha256;
+    if (contracts.schema_version !== 1 ||
+        contracts.kind !== "qa_action_contracts" ||
+        contracts.not_evidence !== true ||
+        canonicalSha256(unsigned) !== contracts.contracts_sha256) {
+      throw new Error("Action contracts failed canonical integrity validation.");
+    }
+    if (planInput.sha256 !== contracts.plan_sha256) {
+      throw new Error("Action contracts do not bind the current plan.");
+    }
+    if (!planAuditInput || !contextInput ||
+        planAuditInput.sha256 !== contracts.plan_audit_sha256) {
+      throw new Error(
+        "Action contracts do not bind the current plan audit.",
+      );
+    }
+    const context = contextInput.value;
+    const unsignedContext = { ...context };
+    delete unsignedContext.context_sha256;
+    if (context.context_sha256 !== contracts.context_sha256 ||
+        canonicalSha256(unsignedContext) !== context.context_sha256 ||
+        context.ready !== true ||
+        !Array.isArray(context.blockers) ||
+        context.blockers.length !== 0 ||
+        context.semantic_summary?.adapter?.environment_boundary_confirmed !== true ||
+        ["production", "prod", "live"].includes(
+          String(context.semantic_summary?.adapter?.runtime_mode || "").toLowerCase(),
+        ) ||
+        context.capability_graph?.tool_registry_sha256 !==
+          TRUSTED_TOOL_REGISTRY_SHA256) {
+      throw new Error(
+        "Action contracts do not bind a current policy-authorized context.",
+      );
+    }
+    if (!Array.isArray(contracts.actions) ||
+        contracts.actions.some((item) => !isObject(item) || item.authorized !== true)) {
+      throw new Error("Action contracts must explicitly authorize every plan step.");
+    }
+    if (contracts.tool_registry_sha256 !== TRUSTED_TOOL_REGISTRY_SHA256) {
+      throw new Error("Action contracts do not bind the current trusted ToolRegistry.");
+    }
+    for (const item of contracts.actions) {
+      const trustedSpec = TRUSTED_TOOL_SPECS.get(item.action);
+      if (!trustedSpec ||
+          item.tool_version !== trustedSpec.version ||
+          item.tool_spec_sha256 !== trustedSpec.specSha256 ||
+          item.risk_class !== trustedSpec.riskClass ||
+          item.idempotent !== trustedSpec.idempotent ||
+          canonicalJson(item.required_authorizations) !==
+            canonicalJson(trustedSpec.requiredAuthorizations) ||
+          canonicalJson(item.granted_authorizations) !==
+            canonicalJson(trustedSpec.requiredAuthorizations)) {
+        throw new Error(
+          `Action contract does not match the trusted ToolSpec/policy for ${item.scenario_id}/${item.step_id}.`,
+        );
+      }
+      if (item.resolution_policy_sha256 !== RESOLUTION_POLICY_SHA256) {
+        throw new Error("Action contract resolution policy is unsupported.");
+      }
+      const commandExecutionBinding =
+        validateCommandExecutionBindingShape(item);
+      const expectedAuthorization = canonicalSha256({
+        run_id: contracts.run_id,
+        generation: contracts.generation,
+        iteration: contracts.iteration,
+        scenario_id: item.scenario_id,
+        step_id: item.step_id,
+        action: item.action,
+        plan_sha256: contracts.plan_sha256,
+        context_sha256: contracts.context_sha256,
+        plan_audit_sha256: contracts.plan_audit_sha256,
+        human_authorization_sha256:
+          contracts.human_authorization_sha256,
+        tool_spec_sha256: item.tool_spec_sha256,
+        raw_step_sha256: item.raw_step_sha256,
+        resolution_policy_sha256: item.resolution_policy_sha256,
+        command_execution_binding_sha256:
+          commandExecutionBinding?.binding_sha256 ?? null,
+        required_authorizations: item.required_authorizations,
+        granted_authorizations: item.granted_authorizations,
+      });
+      if (expectedAuthorization !== item.authorization_sha256) {
+        throw new Error(
+          `Action contract authorization hash is invalid for ${item.scenario_id}/${item.step_id}.`,
+        );
+      }
+      if (item.action === "command") {
+        const scenario = planInput.value.scenarios.find(
+          (candidate) =>
+            candidate?.id === item.scenario_id,
+        );
+        const step = scenario?.steps?.find(
+          (candidate) =>
+            candidate?.id === item.step_id,
+        );
+        if (!step || step.action !== "command") {
+          throw new Error(
+            `Bound command is absent from the current plan: ${item.scenario_id}/${item.step_id}.`,
+          );
+        }
+        await verifyCurrentCommandExecutionBinding(
+          item,
+          step,
+        );
+      }
+    }
+    const authorizationTicketSha256 =
+      consumeActionAuthorizationTicket(contracts);
+    await ensureDir(path.dirname(journalPath));
+    let handle;
+    try {
+      handle = await fs.open(
+        journalPath,
+        fsConstants.O_RDWR |
+          fsConstants.O_CREAT |
+          fsConstants.O_APPEND |
+          fsConstants.O_CLOEXEC |
+          (fsConstants.O_NOFOLLOW || 0),
+        0o600,
+      );
+      const info = await handle.stat();
+      if (!info.isFile() || info.nlink !== 1) {
+        throw new Error("Action journal must be a single-link regular file.");
+      }
+    } catch (error) {
+      if (handle) await handle.close();
+      throw error;
+    }
+    const raw = await handle.readFile("utf-8");
+    const currentJournal = await fs.lstat(journalPath);
+    const openedJournal = await handle.stat();
+    if (currentJournal.dev !== openedJournal.dev ||
+        currentJournal.ino !== openedJournal.ino ||
+        currentJournal.nlink !== 1) {
+      throw new Error(
+        "Action journal path changed after its pinned handle was opened.",
+      );
+    }
+    if (raw && !raw.endsWith("\n")) throw new Error("Action journal contains a partial final line.");
+    const events = raw ? raw.trimEnd().split("\n").map((line) => JSON.parse(line)) : [];
+    let previous = null;
+    const intents = new Map();
+    const committed = new Set();
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index];
+      const unsignedEvent = { ...event };
+      delete unsignedEvent.event_sha256;
+      if (event.sequence !== index + 1 ||
+          event.previous_event_sha256 !== previous ||
+          canonicalSha256(unsignedEvent) !== event.event_sha256) {
+        throw new Error(`Action journal hash chain is invalid at sequence ${index + 1}.`);
+      }
+      const contract = contracts.actions.find((item) =>
+        item.scenario_id === event.scenario_id &&
+        item.step_id === event.step_id);
+      const currentEvent = event.run_id === contracts.run_id &&
+        event.generation === contracts.generation &&
+        event.iteration === contracts.iteration;
+      if (currentEvent) {
+        if (!contract ||
+            event.action !== contract.action ||
+            event.tool_spec_sha256 !== contract.tool_spec_sha256 ||
+            event.raw_step_sha256 !== contract.raw_step_sha256 ||
+            event.resolution_policy_sha256 !== contract.resolution_policy_sha256 ||
+            event.human_authorization_sha256 !==
+              contracts.human_authorization_sha256 ||
+            event.idempotent !== contract.idempotent) {
+          throw new Error(`Action journal event does not match its contract at sequence ${index + 1}.`);
+        }
+        if (event.invocation_sha256 !== invocationCommitmentSha256(event.resolved_invocation_sha256) ||
+            event.execution_authorization_sha256 !==
+              executionAuthorizationSha256(contract, event)) {
+          throw new Error(`Action journal execution authorization is invalid at sequence ${index + 1}.`);
+        }
+        const expectedIdempotencyKey = canonicalSha256({
+          run_id: event.run_id,
+          generation: event.generation,
+          iteration: event.iteration,
+          scenario_id: event.scenario_id,
+          step_id: event.step_id,
+          action: event.action,
+          invocation_sha256: event.invocation_sha256,
+          execution_authorization_sha256: event.execution_authorization_sha256,
+        });
+        if (event.idempotency_key !== expectedIdempotencyKey) {
+          throw new Error(`Action journal idempotency key is invalid at sequence ${index + 1}.`);
+        }
+      }
+      if (event.kind === "intent") intents.set(event.sequence, event);
+      if (event.kind === "commit") {
+        if (!intents.has(event.intent_sequence) || committed.has(event.intent_sequence)) {
+          throw new Error(`Action journal commit is orphaned at sequence ${event.sequence}.`);
+        }
+        const intent = intents.get(event.intent_sequence);
+        for (const field of [
+          "run_id", "generation", "iteration", "scenario_id", "step_id",
+          "action", "invocation_sha256", "resolved_invocation_sha256",
+          "execution_controls_sha256", "execution_authorization_sha256",
+          "authorization_ticket_sha256", "raw_step_sha256",
+          "human_authorization_sha256",
+          "resolution_policy_sha256", "tool_spec_sha256",
+          "idempotency_key", "idempotent",
+        ]) {
+          if (event[field] !== intent[field]) {
+            throw new Error(`Action journal commit mismatches intent field ${field}.`);
+          }
+        }
+        committed.add(event.intent_sequence);
+      }
+      previous = event.event_sha256;
+    }
+    if (contracts.human_authorization_sha256 !==
+        NO_HUMAN_AUTHORIZATION_SHA256 &&
+        events.some((event) =>
+          event.run_id === contracts.run_id &&
+          event.generation === contracts.generation &&
+          event.iteration === contracts.iteration)) {
+      throw new Error(
+        "Human-authorized execution intent already has a durable action event; reconcile without redispatch.",
+      );
+    }
+    const journal = new DurableActionJournal(
+      journalPath,
+      contracts,
+      events,
+      handle,
+      authorizationTicketSha256,
+      {
+        dev: openedJournal.dev,
+        ino: openedJournal.ino,
+      },
+    );
+    for (const [sequence, intent] of intents.entries()) {
+      if (committed.has(sequence)) continue;
+      if (intent.idempotent !== true) {
+        throw new Error(
+          `Uncertain non-idempotent action requires human reconciliation: ${intent.scenario_id}/${intent.step_id} (intent ${sequence}).`,
+        );
+      }
+      await journal.appendCommit(intent, sequence, "abandoned_safe");
+    }
+    return journal;
+  }
+
+  contract(scenario, step) {
+    const key = `${scenario.id}\u0000${step.id || ""}`;
+    const contract = this.contractByIdentity.get(key);
+    if (!contract || contract.action !== step.action || contract.authorized !== true) {
+      throw new Error(`No authorized ToolSpec contract for ${scenario.id}/${step.id || ""}.`);
+    }
+    if (canonicalSha256(step) !== contract.raw_step_sha256) {
+      throw new Error(
+        `Raw step does not match its authorized contract for ${scenario.id}/${step.id || ""}.`,
+      );
+    }
+    if (contract.resolution_policy_sha256 !== RESOLUTION_POLICY_SHA256) {
+      throw new Error(
+        `Resolution policy does not match the authorized contract for ${scenario.id}/${step.id || ""}.`,
+      );
+    }
+    return contract;
+  }
+
+  async intent(
+    scenario,
+    rawStep,
+    resolvedStep,
+    executionControlsHash = null,
+  ) {
+    const contract = this.contract(scenario, rawStep);
+    if (!isObject(resolvedStep) ||
+        resolvedStep.id !== rawStep.id ||
+        resolvedStep.action !== rawStep.action ||
+        scenario.id !== contract.scenario_id) {
+      throw new Error(
+        `Resolved action identity changed for ${scenario.id}/${rawStep.id || ""}.`,
+      );
+    }
+    const resolvedInvocationSha256 = canonicalSha256(
+      secretRedactedInvocationPayload(
+        scenario,
+        rawStep,
+        resolvedStep,
+        contract,
+      ),
+    );
+    const invocationSha256 = invocationCommitmentSha256(
+      resolvedInvocationSha256,
+    );
+    const controlsSha256 = executionControlsHash ||
+      executionControlsSha256(rawStep, resolvedStep, contract, {
+        maxArtifactChars: contract.output_limit_bytes || 10000,
+        rawBaseUrl: null,
+        baseUrl: null,
+        rawDefaultHeaders: {},
+        defaultHeaders: {},
+        rawExtraHTTPHeaders: {},
+        extraHTTPHeaders: {},
+      });
+    const executionAuthorization = executionAuthorizationSha256(
+      contract,
+      {
+      run_id: this.contracts.run_id,
+      generation: this.contracts.generation,
+      iteration: this.contracts.iteration,
+      scenario_id: scenario.id,
+      step_id: rawStep.id || "",
+      action: rawStep.action,
+      raw_step_sha256: contract.raw_step_sha256,
+      resolution_policy_sha256: contract.resolution_policy_sha256,
+      resolved_invocation_sha256: resolvedInvocationSha256,
+      execution_controls_sha256: controlsSha256,
+      authorization_ticket_sha256: this.authorizationTicketSha256,
+      human_authorization_sha256:
+        this.contracts.human_authorization_sha256,
+      invocation_sha256: invocationSha256,
+      tool_spec_sha256: contract.tool_spec_sha256,
+      },
+    );
+    const idempotencyKey = canonicalSha256({
+      run_id: this.contracts.run_id,
+      generation: this.contracts.generation,
+      iteration: this.contracts.iteration,
+      scenario_id: scenario.id,
+      step_id: rawStep.id || "",
+      action: rawStep.action,
+      invocation_sha256: invocationSha256,
+      execution_authorization_sha256: executionAuthorization,
+    });
+    const event = await this.append({
+      kind: "intent",
+      intent_sequence: null,
+      scenario_id: scenario.id,
+      step_id: rawStep.id || "",
+      action: rawStep.action,
+      invocation_sha256: invocationSha256,
+      resolved_invocation_sha256: resolvedInvocationSha256,
+      execution_controls_sha256: controlsSha256,
+      authorization_ticket_sha256: this.authorizationTicketSha256,
+      execution_authorization_sha256: executionAuthorization,
+      human_authorization_sha256:
+        this.contracts.human_authorization_sha256,
+      raw_step_sha256: contract.raw_step_sha256,
+      resolution_policy_sha256: contract.resolution_policy_sha256,
+      tool_spec_sha256: contract.tool_spec_sha256,
+      idempotency_key: idempotencyKey,
+      idempotent: contract.idempotent,
+      status: "pending",
+    });
+    return { event, contract };
+  }
+
+  async skipped(scenario, rawStep) {
+    let controlsSha256 = null;
+    if (rawStep.action === "command") {
+      const contract = this.contract(scenario, rawStep);
+      const commandDispatch =
+        await verifyCurrentCommandExecutionBinding(
+          contract,
+          rawStep,
+        );
+      controlsSha256 = executionControlsSha256(
+        rawStep,
+        rawStep,
+        contract,
+        {
+          maxArtifactChars:
+            contract.output_limit_bytes || 10000,
+          rawBaseUrl: null,
+          baseUrl: null,
+          rawDefaultHeaders: {},
+          defaultHeaders: {},
+          rawExtraHTTPHeaders: {},
+          extraHTTPHeaders: {},
+        },
+        commandDispatch,
+      );
+    }
+    const token = await this.intent(
+      scenario,
+      rawStep,
+      rawStep,
+      controlsSha256,
+    );
+    await this.commit(token, "skipped");
+  }
+
+  async commit(token, status) {
+    await this.appendCommit(token.event, token.event.sequence, status);
+  }
+
+  async appendCommit(intent, intentSequence, status) {
+    return await this.append({
+      kind: "commit",
+      intent_sequence: intentSequence,
+      run_id: intent.run_id,
+      generation: intent.generation,
+      iteration: intent.iteration,
+      scenario_id: intent.scenario_id,
+      step_id: intent.step_id,
+      action: intent.action,
+      invocation_sha256: intent.invocation_sha256,
+      resolved_invocation_sha256: intent.resolved_invocation_sha256,
+      execution_controls_sha256: intent.execution_controls_sha256,
+      authorization_ticket_sha256: intent.authorization_ticket_sha256,
+      execution_authorization_sha256: intent.execution_authorization_sha256,
+      human_authorization_sha256:
+        intent.human_authorization_sha256,
+      raw_step_sha256: intent.raw_step_sha256,
+      resolution_policy_sha256: intent.resolution_policy_sha256,
+      tool_spec_sha256: intent.tool_spec_sha256,
+      idempotency_key: intent.idempotency_key,
+      idempotent: intent.idempotent,
+      status,
+    });
+  }
+
+  async append(fields) {
+    const currentBefore = await fs.lstat(this.path);
+    if (currentBefore.dev !== this.openedIdentity.dev ||
+        currentBefore.ino !== this.openedIdentity.ino ||
+        currentBefore.nlink !== 1) {
+      throw new Error(
+        "Action journal path was replaced before durable append.",
+      );
+    }
+    const {
+      run_id = this.contracts.run_id,
+      generation = this.contracts.generation,
+      iteration = this.contracts.iteration,
+      ...eventFields
+    } = fields;
+    const unsigned = {
+      schema_version: 1,
+      sequence: this.nextSequence,
+      previous_event_sha256: this.previousHash,
+      ...eventFields,
+      run_id,
+      generation,
+      iteration,
+      occurred_at: new Date().toISOString(),
+    };
+    const event = { ...unsigned, event_sha256: canonicalSha256(unsigned) };
+    await this.handle.write(`${canonicalJson(event)}\n`, null, "utf-8");
+    await this.handle.sync();
+    const currentAfter = await fs.lstat(this.path);
+    if (currentAfter.dev !== this.openedIdentity.dev ||
+        currentAfter.ino !== this.openedIdentity.ino ||
+        currentAfter.nlink !== 1) {
+      throw new Error(
+        "Action journal path was replaced during durable append.",
+      );
+    }
+    this.events.push(event);
+    this.previousHash = event.event_sha256;
+    this.nextSequence += 1;
+    return event;
+  }
+
+  async close() {
+    if (!this.handle) return;
+    const handle = this.handle;
+    this.handle = null;
+    await handle.close();
+  }
+}
+
+async function validateCommandPlanBinding(
+  plan,
+  planInput,
+  auditInput,
+) {
   if (!planNeedsCommand(plan)) return;
-  if (!auditPath) {
+  if (!auditInput) {
     throw new Error("Command plans require --plan-audit-summary; refusing to execute an unvalidated local command.");
   }
-  const audit = JSON.parse(await fs.readFile(auditPath, "utf-8"));
-  const expectedPlan = path.resolve(planPath);
+  const audit = auditInput.value;
+  const expectedPlan = planInput.path;
   const boundPlan = audit.plan ? path.resolve(String(audit.plan)) : "";
-  const expectedHash = await sha256File(planPath);
+  const expectedHash = planInput.sha256;
   const boundHash = audit.artifact_hashes?.plan_sha256;
   if (audit.passed !== true) throw new Error("Command plan audit is not passed.");
   if (boundPlan !== expectedPlan) throw new Error("Command plan audit path does not match --plan.");
   if (!boundHash || boundHash !== expectedHash) throw new Error("Command plan changed after validation; SHA-256 binding mismatch.");
 }
 
-function resolveRuntimeRefs(value, ctx) {
-  if (Array.isArray(value)) return value.map((item) => resolveRuntimeRefs(item, ctx));
-  if (isObject(value)) {
-    const templateValue = Object.prototype.hasOwnProperty.call(value, "template") ? value.template : value.$template;
-    if (typeof templateValue === "string") {
-      const rendered = resolveTemplateString(templateValue, ctx, value.encodeVars === true);
-      if (value.json === true) return JSON.parse(rendered);
-      return rendered;
+const REFERENCE_KEYS = new Set(["env", "$env", "var", "$var", "template", "$template"]);
+const ENV_REFERENCE_FIELDS = new Set(["env", "$env", "prefix", "suffix", "json"]);
+const VAR_REFERENCE_FIELDS = new Set(["var", "$var", "prefix", "suffix", "json"]);
+const TEMPLATE_REFERENCE_FIELDS = new Set(["template", "$template", "encodeVars", "json"]);
+const COMMAND_CONTROL_FIELDS = ["command", "cmd", "cwd", "shell", "env"];
+const HIGH_RISK_NETWORK_ACTIONS = new Set(["api", "cleanupApi", "pollApi"]);
+const CREDENTIAL_HEADER_NAMES = new Set([
+  "api-key",
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "x-access-token",
+  "x-api-key",
+  "x-auth-token",
+]);
+const ROUTING_HEADER_NAMES = new Set([
+  ":authority",
+  "forwarded",
+  "host",
+  "x-http-method-override",
+  "x-method-override",
+  "x-original-url",
+  "x-rewrite-url",
+]);
+const ROUTING_LAUNCH_ARGUMENT_PREFIXES = [
+  "--host-resolver-rules",
+  "--host-rules",
+  "--proxy-bypass-list",
+  "--proxy-pac-url",
+  "--proxy-server",
+];
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SECRETISH_NAME_PATTERN = /authorization|auth|access[_-]?token|id[_-]?token|refresh[_-]?token|session[_-]?token|api[_-]?key|secret|jwt|cookie|password|^sid$/i;
+const SENSITIVE_REFERENCE_PATH_PATTERN = /(?:^|\.)(?:headers?|cookies?|cookie|body|json)(?:\.|$)/i;
+const DESTRUCTIVE_COMMAND_PATTERN = /\b(?:rm\s+-rf|drop\s+table|truncate\s+table|delete\s+from|update\s+\w+\s+set|insert\s+into|gh\s+repo\s+delete|kubectl\s+delete|terraform\s+destroy|(?:npm|pnpm|yarn)\s+(?:publish|install|add)|(?:pip|pip3)\s+install)\b/i;
+const SECRET_COMMAND_PATH_PATTERN = /(?:^|[\/\s"'=])(?:\.env(?:\.|\/|\b)|[^\/\s]*credentials?[^\/\s]*|[^\/\s]*(?:private[_-]?key|password|secret|token)[^\/\s]*|\/(?:run\/)?secrets?(?:\/|\b))/i;
+const SECRET_COMMAND_READ_PATTERN = /\b(?:cat|tac|head|tail|less|more|grep|sed|awk|dd|cp|scp|rsync|curl|wget|printenv|env|set|export|base64|openssl|tar|zip|python|python3|node|ruby|sh|bash|zsh)\b/i;
+const INLINE_SECRET_ACCESS_PATTERN = /\b(?:process\.env|os\.environ|getenv|Deno\.env|ENV\[|printenv)\b/i;
+
+function objectHasReferenceDiscriminator(value) {
+  if (!isObject(value)) return false;
+  if (["$env", "$var", "$template"].some((key) => Object.prototype.hasOwnProperty.call(value, key))) {
+    return true;
+  }
+  for (const key of ["env", "var", "template"]) {
+    if (typeof value[key] === "string") return true;
+  }
+  const keys = Object.keys(value);
+  return keys.length > 0 && keys.every((key) =>
+    REFERENCE_KEYS.has(key) ||
+    ["prefix", "suffix", "json", "encodeVars"].includes(key));
+}
+
+function parseReferenceObject(value, location) {
+  if (!objectHasReferenceDiscriminator(value)) return null;
+  const present = [...REFERENCE_KEYS].filter((key) =>
+    Object.prototype.hasOwnProperty.call(value, key));
+  if (present.length !== 1) {
+    throw new Error(
+      `Dynamic reference at ${location} must select exactly one of env/$env, var/$var, or template/$template.`,
+    );
+  }
+  const discriminator = present[0];
+  const kind = discriminator.replace("$", "");
+  const allowed = kind === "env"
+    ? ENV_REFERENCE_FIELDS
+    : kind === "var"
+      ? VAR_REFERENCE_FIELDS
+      : TEMPLATE_REFERENCE_FIELDS;
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length) {
+    throw new Error(
+      `Dynamic ${kind} reference at ${location} is not a closed reference object; unknown fields: ${unknown.sort().join(", ")}.`,
+    );
+  }
+  const referenceValue = value[discriminator];
+  if (typeof referenceValue !== "string" || !referenceValue.trim() || referenceValue.trim() !== referenceValue) {
+    throw new Error(`Dynamic ${kind} reference at ${location} requires non-empty trimmed text.`);
+  }
+  if (kind !== "template" && !ENV_NAME_PATTERN.test(referenceValue)) {
+    throw new Error(`Dynamic ${kind} reference at ${location} has an invalid variable name.`);
+  }
+  if ("prefix" in value && typeof value.prefix !== "string") {
+    throw new Error(`Dynamic ${kind} reference at ${location} prefix must be a string.`);
+  }
+  if ("suffix" in value && typeof value.suffix !== "string") {
+    throw new Error(`Dynamic ${kind} reference at ${location} suffix must be a string.`);
+  }
+  if ("json" in value && typeof value.json !== "boolean") {
+    throw new Error(`Dynamic ${kind} reference at ${location} json must be a boolean.`);
+  }
+  if ("encodeVars" in value && typeof value.encodeVars !== "boolean") {
+    throw new Error(`Dynamic template reference at ${location} encodeVars must be a boolean.`);
+  }
+  return { kind, discriminator, referenceValue };
+}
+
+function structuredSecretRedactedValue(rawValue, resolvedValue, location) {
+  if (Array.isArray(rawValue)) {
+    if (!Array.isArray(resolvedValue) ||
+        rawValue.length !== resolvedValue.length) {
+      throw new Error(
+        `Resolved structure changed outside a reference at ${location}.`,
+      );
     }
-    const varName = value.var || value.$var;
-    if (typeof varName === "string" && varName.trim()) {
+    return rawValue.map((item, index) =>
+      structuredSecretRedactedValue(
+        item,
+        resolvedValue[index],
+        `${location}[${index}]`,
+      ));
+  }
+  if (isObject(rawValue)) {
+    const reference = parseReferenceObject(rawValue, location);
+    if (reference) {
+      return {
+        $dynamic_reference: {
+          alias: reference.discriminator,
+          kind: reference.kind,
+          location,
+          source: reference.referenceValue,
+          raw_reference_sha256: canonicalSha256(rawValue),
+          resolved_value: "[REDACTED]",
+        },
+      };
+    }
+    if (!isObject(resolvedValue) ||
+        canonicalJson(Object.keys(rawValue).sort()) !==
+          canonicalJson(Object.keys(resolvedValue).sort())) {
+      throw new Error(
+        `Resolved object fields changed outside a reference at ${location}.`,
+      );
+    }
+    const out = {};
+    for (const [key, item] of Object.entries(rawValue)) {
+      out[key] = structuredSecretRedactedValue(
+        item,
+        resolvedValue[key],
+        `${location}.${key}`,
+      );
+    }
+    return out;
+  }
+  return resolvedValue;
+}
+
+function secretRedactedInvocationPayload(
+  scenario,
+  rawStep,
+  resolvedStep,
+  contract,
+) {
+  const location = `scenario.${scenario.id}.step.${rawStep.id || ""}`;
+  return {
+    schema_version: 2,
+    kind: "qa_secret_redacted_resolved_invocation",
+    scenario_id: scenario.id,
+    step_id: rawStep.id || "",
+    action: rawStep.action,
+    arguments: structuredSecretRedactedValue(
+      rawStep,
+      resolvedStep,
+      location,
+    ),
+    tool_version: contract.tool_version,
+    tool_spec_sha256: contract.tool_spec_sha256,
+  };
+}
+
+function assertNoDynamicReferences(value, location) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoDynamicReferences(item, `${location}[${index}]`));
+    return;
+  }
+  if (!isObject(value)) return;
+  if (objectHasReferenceDiscriminator(value)) {
+    parseReferenceObject(value, location);
+    throw new Error(`Dynamic references are forbidden in execution control field ${location}.`);
+  }
+  for (const [key, item] of Object.entries(value)) {
+    assertNoDynamicReferences(item, `${location}.${key}`);
+  }
+}
+
+function validateHighRiskHeaders(value, location) {
+  if (!isObject(value)) {
+    throw new Error(`${location} must be a static header object.`);
+  }
+  for (const [rawName, headerValue] of Object.entries(value)) {
+    const name = rawName.trim().toLowerCase();
+    if (ROUTING_HEADER_NAMES.has(name) || name.startsWith("x-forwarded-")) {
+      throw new Error(
+        `High-risk network actions forbid routing header ${rawName}.`,
+      );
+    }
+    if (!CREDENTIAL_HEADER_NAMES.has(name)) {
+      assertNoDynamicReferences(headerValue, `${location}.${rawName}`);
+    }
+  }
+}
+
+function absoluteHighRiskNetworkTarget(baseUrl, step, location) {
+  const target = typeof step.url === "string" && step.url
+    ? step.url
+    : (() => {
+        if (typeof baseUrl !== "string" || !baseUrl) {
+          throw new Error(
+            `High-risk network action ${location} requires an absolute step.url or plan.baseUrl.`,
+          );
+        }
+        const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+        const rawPath = step.path ?? "/";
+        if (typeof rawPath !== "string") {
+          throw new Error(
+            `High-risk network action ${location} requires a static step.path.`,
+          );
+        }
+        return `${base}${rawPath.startsWith("/") ? rawPath : `/${rawPath}`}`;
+      })();
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch (error) {
+    throw new Error(
+      `High-risk network target ${location} must be an absolute HTTP(S) URL: ${error.message || String(error)}`,
+    );
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password ||
+      parsed.hash) {
+    throw new Error(
+      `High-risk network target ${location} must be an absolute credential-free HTTP(S) URL without a fragment.`,
+    );
+  }
+  return parsed.href;
+}
+
+function validateHighRiskNetworkBoundary(plan, step, stepLocation) {
+  for (const field of ["method", "url", "path"]) {
+    if (Object.prototype.hasOwnProperty.call(step, field) &&
+        typeof step[field] !== "string") {
+      throw new Error(
+        `High-risk network actions require a static ${stepLocation}.${field}.`,
+      );
+    }
+  }
+  for (const field of ["urlTemplate", "pathTemplate"]) {
+    if (Object.prototype.hasOwnProperty.call(step, field)) {
+      throw new Error(
+        `High-risk network actions forbid dynamic ${stepLocation}.${field}.`,
+      );
+    }
+  }
+  absoluteHighRiskNetworkTarget(plan.baseUrl, step, stepLocation);
+  if (typeof plan.baseUrl === "string" && plan.baseUrl) {
+    const parsedBase = new URL(plan.baseUrl);
+    if (parsedBase.search || parsedBase.hash) {
+      throw new Error(
+        "High-risk plan.baseUrl cannot contain a query or fragment.",
+      );
+    }
+  }
+
+  if (plan.contextOptions !== undefined) {
+    if (!isObject(plan.contextOptions)) {
+      throw new Error("plan.contextOptions must be a static object.");
+    }
+    for (const field of ["baseURL", "proxy"]) {
+      if (Object.prototype.hasOwnProperty.call(plan.contextOptions, field)) {
+        throw new Error(
+          `High-risk network actions forbid plan.contextOptions.${field}.`,
+        );
+      }
+    }
+    for (const [field, value] of Object.entries(plan.contextOptions)) {
+      if (field === "extraHTTPHeaders") {
+        validateHighRiskHeaders(
+          value,
+          "plan.contextOptions.extraHTTPHeaders",
+        );
+      } else {
+        assertNoDynamicReferences(value, `plan.contextOptions.${field}`);
+      }
+    }
+  }
+
+  if (plan.launchOptions !== undefined) {
+    if (!isObject(plan.launchOptions)) {
+      throw new Error("plan.launchOptions must be a static object.");
+    }
+    if (Object.prototype.hasOwnProperty.call(plan.launchOptions, "proxy")) {
+      throw new Error(
+        "High-risk network actions forbid plan.launchOptions.proxy.",
+      );
+    }
+    assertNoDynamicReferences(plan.launchOptions, "plan.launchOptions");
+    const args = plan.launchOptions.args ?? [];
+    if (Array.isArray(args) && args.some((argument) =>
+      typeof argument === "string" &&
+      ROUTING_LAUNCH_ARGUMENT_PREFIXES.some((prefix) =>
+        argument.startsWith(prefix)))) {
+      throw new Error(
+        "High-risk network actions forbid browser routing arguments.",
+      );
+    }
+  }
+
+  for (const field of ["defaultHeaders", "extraHTTPHeaders"]) {
+    if (Object.prototype.hasOwnProperty.call(plan, field)) {
+      validateHighRiskHeaders(plan[field], `plan.${field}`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(step, "headers")) {
+    validateHighRiskHeaders(step.headers, `${stepLocation}.headers`);
+  }
+  for (const [field, value] of Object.entries(step)) {
+    if (field !== "headers") {
+      assertNoDynamicReferences(value, `${stepLocation}.${field}`);
+    }
+  }
+}
+
+function validatePlanReferenceBoundary(plan) {
+  if (!isObject(plan) || objectHasReferenceDiscriminator(plan)) {
+    throw new Error("Plan root must be a static object and cannot be replaced by a dynamic reference.");
+  }
+  if (!Array.isArray(plan.scenarios)) {
+    throw new Error("plan.scenarios must be a static array.");
+  }
+  const hasHighRiskNetworkAction = plan.scenarios.some((scenario) =>
+    isObject(scenario) &&
+    Array.isArray(scenario.steps) &&
+    scenario.steps.some((step) =>
+      isObject(step) && HIGH_RISK_NETWORK_ACTIONS.has(step.action)));
+  if (hasHighRiskNetworkAction &&
+      Object.prototype.hasOwnProperty.call(plan, "baseUrl") &&
+      typeof plan.baseUrl !== "string") {
+    throw new Error(
+      "High-risk network actions require a static plan.baseUrl.",
+    );
+  }
+  for (let scenarioIndex = 0; scenarioIndex < plan.scenarios.length; scenarioIndex += 1) {
+    const scenario = plan.scenarios[scenarioIndex];
+    const scenarioLocation = `plan.scenarios[${scenarioIndex}]`;
+    if (!isObject(scenario) || objectHasReferenceDiscriminator(scenario)) {
+      throw new Error(`${scenarioLocation} must be a static scenario object.`);
+    }
+    if (typeof scenario.id !== "string" || !scenario.id) {
+      throw new Error(`${scenarioLocation}.id must be a static non-empty string.`);
+    }
+    if (!Array.isArray(scenario.steps)) {
+      throw new Error(`${scenarioLocation}.steps must be a static array.`);
+    }
+    for (let stepIndex = 0; stepIndex < scenario.steps.length; stepIndex += 1) {
+      const step = scenario.steps[stepIndex];
+      const stepLocation = `${scenarioLocation}.steps[${stepIndex}]`;
+      if (!isObject(step) || objectHasReferenceDiscriminator(step)) {
+        throw new Error(`${stepLocation} must be a static step object.`);
+      }
+      if ((Object.prototype.hasOwnProperty.call(step, "id") &&
+           (typeof step.id !== "string" || !step.id)) ||
+          typeof step.action !== "string" || !step.action) {
+        throw new Error(
+          `${stepLocation} action and any declared id must be static non-empty strings.`,
+        );
+      }
+      if (step.action === "command") {
+        for (const field of COMMAND_CONTROL_FIELDS) {
+          if (Object.prototype.hasOwnProperty.call(step, field)) {
+            assertNoDynamicReferences(step[field], `${stepLocation}.${field}`);
+          }
+        }
+      }
+      if (HIGH_RISK_NETWORK_ACTIONS.has(step.action)) {
+        validateHighRiskNetworkBoundary(plan, step, stepLocation);
+      }
+    }
+  }
+}
+
+function resolveRuntimeRefs(value, ctx, location = "step") {
+  if (Array.isArray(value)) {
+    return value.map((item, index) => resolveRuntimeRefs(item, ctx, `${location}[${index}]`));
+  }
+  if (isObject(value)) {
+    const reference = parseReferenceObject(value, location);
+    if (reference) {
+      if (reference.kind === "env") {
+        throw new Error(`Environment reference at ${location} was not resolved during plan loading.`);
+      }
+      if (reference.kind === "template") {
+        const rendered = resolveTemplateString(
+          reference.referenceValue,
+          ctx,
+          value.encodeVars === true,
+        );
+        const resolved = value.json === true ? JSON.parse(rendered) : rendered;
+        if (SENSITIVE_REFERENCE_PATH_PATTERN.test(location)) {
+          registerSensitiveResolvedValue(resolved);
+        }
+        return resolved;
+      }
+      const varName = reference.referenceValue;
       if (!Object.prototype.hasOwnProperty.call(ctx.vars || {}, varName)) {
         throw new Error(`Missing runtime variable: ${varName}`);
       }
       const raw = ctx.vars[varName];
-      const resolved = `${value.prefix || ""}${raw}${value.suffix || ""}`;
-      if (value.json === true) return JSON.parse(resolved);
+      const rendered = `${value.prefix || ""}${raw}${value.suffix || ""}`;
+      const resolved = value.json === true ? JSON.parse(rendered) : rendered;
+      if (SECRETISH_NAME_PATTERN.test(varName) ||
+          SENSITIVE_REFERENCE_PATH_PATTERN.test(location)) {
+        registerSensitiveResolvedValue(resolved);
+      }
       return resolved;
     }
     const out = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = resolveRuntimeRefs(item, ctx);
+      out[key] = resolveRuntimeRefs(item, ctx, `${location}.${key}`);
     }
     return out;
   }
   return value;
 }
 
-function resolveEnvRefs(value) {
-  if (Array.isArray(value)) return value.map((item) => resolveEnvRefs(item));
+function resolveEnvRefs(value, location = "plan") {
+  if (Array.isArray(value)) {
+    return value.map((item, index) => resolveEnvRefs(item, `${location}[${index}]`));
+  }
   if (isObject(value)) {
-    const envName = value.env || value.$env;
-    if (typeof envName === "string" && envName.trim()) {
+    const reference = parseReferenceObject(value, location);
+    if (reference) {
+      if (reference.kind !== "env") {
+        return { ...value };
+      }
+      const envName = reference.referenceValue;
       const raw = process.env[envName];
       if (raw === undefined) throw new Error(`Missing required environment variable: ${envName}`);
-      const resolved = `${value.prefix || ""}${raw}${value.suffix || ""}`;
-      if (value.json === true) return JSON.parse(resolved);
+      const rendered = `${value.prefix || ""}${raw}${value.suffix || ""}`;
+      const resolved = value.json === true ? JSON.parse(rendered) : rendered;
+      registerSensitiveResolvedValue(raw);
+      registerSensitiveResolvedValue(resolved);
+      sensitiveEnvironmentNames.add(envName);
       return resolved;
     }
     const out = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = resolveEnvRefs(item);
+      out[key] = resolveEnvRefs(item, `${location}.${key}`);
     }
     return out;
   }
   return value;
+}
+
+function validateResolvedCommandBoundary(rawStep, resolvedStep) {
+  for (const field of COMMAND_CONTROL_FIELDS) {
+    if (canonicalSha256(rawStep[field] ?? null) !== canonicalSha256(resolvedStep[field] ?? null)) {
+      throw new Error(`Resolved command control field changed dynamically: step.${field}.`);
+    }
+  }
+  const commandValue = resolvedStep.command || resolvedStep.cmd;
+  if (!commandValue) throw new Error("command step requires command or cmd.");
+  if (!Array.isArray(commandValue) || !commandValue.length ||
+      commandValue.some((part) => typeof part !== "string" || !part)) {
+    throw new Error(
+      "Resolved command must be a non-empty string argv array under the trusted ToolSpec.",
+    );
+  }
+  if (resolvedStep.shell === true) {
+    throw new Error("Resolved command cannot enable a shell outside the trusted ToolSpec.");
+  }
+  if (resolvedStep.cwd !== undefined &&
+      (typeof resolvedStep.cwd !== "string" || !resolvedStep.cwd)) {
+    throw new Error("Resolved command cwd must be a non-empty static string.");
+  }
+  const commandParts = Array.isArray(commandValue)
+    ? commandValue.map((part) => String(part))
+    : [String(commandValue)];
+  const commandText = commandParts.join(" ");
+  if (DESTRUCTIVE_COMMAND_PATTERN.test(commandText)) {
+    throw new Error("Resolved command failed the destructive command boundary.");
+  }
+  if (INLINE_SECRET_ACCESS_PATTERN.test(commandText) ||
+      (SECRET_COMMAND_PATH_PATTERN.test(commandText) &&
+       SECRET_COMMAND_READ_PATTERN.test(commandText))) {
+    throw new Error("Resolved command failed the secret read/exfiltration boundary.");
+  }
+}
+
+const COMMAND_INHERITED_ENV_NAMES = [
+  "CI",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "NODE_PATH",
+  "PATH",
+  "PYTHONPATH",
+  "TERM",
+  "TMPDIR",
+];
+const MAX_COMMAND_FILE_BYTES = 256 * 1024 * 1024;
+
+function buildCommandEnvironment(step) {
+  const explicit = step.env === undefined ? {} : step.env;
+  if (!isObject(explicit) ||
+      Object.values(explicit).some((value) => typeof value !== "string")) {
+    throw new Error("Command env must be a static string-to-string object.");
+  }
+  const env = {};
+  for (const name of COMMAND_INHERITED_ENV_NAMES) {
+    if (typeof process.env[name] === "string") env[name] = process.env[name];
+  }
+  Object.assign(env, explicit);
+  for (const name of sensitiveEnvironmentNames) delete env[name];
+  return env;
+}
+
+function assertExactObjectFields(value, expected, label) {
+  if (!isObject(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const observed = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (canonicalJson(observed) !== canonicalJson(wanted)) {
+    throw new Error(`${label} has unknown or missing fields.`);
+  }
+}
+
+function validateCommandFileIdentityShape(value, expectedKind) {
+  assertExactObjectFields(
+    value,
+    [
+      "schema_version",
+      "kind",
+      "real_path",
+      "device",
+      "inode",
+      "size",
+      "mtime_ns",
+      "mode",
+      "sha256",
+    ],
+    "Command file identity",
+  );
+  if (value.schema_version !== 1 ||
+      value.kind !== expectedKind ||
+      typeof value.real_path !== "string" ||
+      !path.isAbsolute(value.real_path) ||
+      !/^[0-9]+$/.test(value.device) ||
+      !/^[0-9]+$/.test(value.inode) ||
+      !/^[0-9]+$/.test(value.size) ||
+      !/^[0-9]+$/.test(value.mtime_ns) ||
+      !/^[0-9]+$/.test(value.mode) ||
+      !/^[0-9a-f]{64}$/.test(value.sha256)) {
+    throw new Error("Command file identity is malformed.");
+  }
+}
+
+function validateCommandExecutionBindingShape(contract) {
+  const value = contract.command_execution_binding;
+  if (contract.action !== "command") {
+    if (value !== null) {
+      throw new Error(
+        "Non-command action cannot carry a command execution binding.",
+      );
+    }
+    return null;
+  }
+  assertExactObjectFields(
+    value,
+    [
+      "schema_version",
+      "kind",
+      "base_cwd",
+      "cwd",
+      "environment_sha256",
+      "inherited_environment_names",
+      "executable",
+      "direct_files",
+      "binding_sha256",
+    ],
+    "Command execution binding",
+  );
+  if (value.schema_version !== 1 ||
+      value.kind !== "qa_command_execution_binding" ||
+      typeof value.base_cwd !== "string" ||
+      !path.isAbsolute(value.base_cwd) ||
+      typeof value.cwd !== "string" ||
+      !path.isAbsolute(value.cwd) ||
+      !/^[0-9a-f]{64}$/.test(value.environment_sha256) ||
+      canonicalJson(value.inherited_environment_names) !==
+        canonicalJson(COMMAND_INHERITED_ENV_NAMES) ||
+      !Array.isArray(value.direct_files) ||
+      !/^[0-9a-f]{64}$/.test(value.binding_sha256)) {
+    throw new Error("Command execution binding is malformed.");
+  }
+  validateCommandFileIdentityShape(value.executable, "executable");
+  let previousIndex = 0;
+  for (const item of value.direct_files) {
+    assertExactObjectFields(
+      item,
+      ["argv_index", "argument_path", "identity"],
+      "Command direct file binding",
+    );
+    if (!Number.isSafeInteger(item.argv_index) ||
+        item.argv_index <= previousIndex ||
+        typeof item.argument_path !== "string" ||
+        !path.isAbsolute(item.argument_path)) {
+      throw new Error("Command direct file binding is malformed.");
+    }
+    previousIndex = item.argv_index;
+    validateCommandFileIdentityShape(item.identity, "direct_input");
+  }
+  const unsigned = { ...value };
+  delete unsigned.binding_sha256;
+  if (canonicalSha256(unsigned) !== value.binding_sha256) {
+    throw new Error("Command execution binding hash is invalid.");
+  }
+  return value;
+}
+
+function commandStatIdentity(info) {
+  return {
+    device: info.dev.toString(),
+    inode: info.ino.toString(),
+    size: info.size.toString(),
+    mtime_ns: info.mtimeNs.toString(),
+    mode: info.mode.toString(),
+  };
+}
+
+function sameCommandStat(left, right) {
+  return canonicalJson(commandStatIdentity(left)) ===
+    canonicalJson(commandStatIdentity(right)) &&
+    left.nlink.toString() === right.nlink.toString();
+}
+
+async function stableCommandFileIdentity(
+  inputPath,
+  expectedKind,
+  requireExecutable,
+) {
+  const realPath = await fs.realpath(inputPath);
+  const flags = fsConstants.O_RDONLY |
+    fsConstants.O_CLOEXEC |
+    (fsConstants.O_NOFOLLOW || 0);
+  const handle = await fs.open(realPath, flags);
+  try {
+    const before = await handle.stat({ bigint: true });
+    const pathBefore = await fs.lstat(realPath, { bigint: true });
+    if (!before.isFile() || before.nlink !== 1n ||
+        before.size > BigInt(MAX_COMMAND_FILE_BYTES)) {
+      throw new Error(
+        `Command ${expectedKind} must be a bounded single-link regular file.`,
+      );
+    }
+    if (requireExecutable && (before.mode & 0o111n) === 0n) {
+      throw new Error("Bound command executable has no execute bit.");
+    }
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let total = 0n;
+    while (true) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        0,
+        buffer.length,
+        null,
+      );
+      if (bytesRead === 0) break;
+      total += BigInt(bytesRead);
+      if (total > BigInt(MAX_COMMAND_FILE_BYTES)) {
+        throw new Error(`Command ${expectedKind} grew while hashing.`);
+      }
+      digest.update(buffer.subarray(0, bytesRead));
+    }
+    const after = await handle.stat({ bigint: true });
+    const pathAfter = await fs.lstat(realPath, { bigint: true });
+    if (!sameCommandStat(before, after) ||
+        !sameCommandStat(before, pathBefore) ||
+        !sameCommandStat(before, pathAfter)) {
+      throw new Error(
+        `Command ${expectedKind} changed while being hashed.`,
+      );
+    }
+    return {
+      schema_version: 1,
+      kind: expectedKind,
+      real_path: realPath,
+      ...commandStatIdentity(before),
+      sha256: digest.digest("hex"),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function resolveCurrentCommandExecutable(argv0, cwd, environment) {
+  const containsSeparator = argv0.includes(path.sep) ||
+    (path.posix.sep !== path.sep && argv0.includes(path.posix.sep)) ||
+    (path.win32.sep !== path.sep && argv0.includes(path.win32.sep));
+  if (path.isAbsolute(argv0) || containsSeparator) {
+    return await fs.realpath(
+      path.isAbsolute(argv0) ? argv0 : path.resolve(cwd, argv0),
+    );
+  }
+  const searchPath = typeof environment.PATH === "string"
+    ? environment.PATH
+    : "";
+  for (const directory of searchPath.split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.resolve(directory, argv0);
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return await fs.realpath(candidate);
+    } catch (_) {
+      // 继续检查下一个精确匹配的 PATH 目录。
+    }
+  }
+  throw new Error(
+    `Command executable is unavailable on the bound PATH: ${argv0}.`,
+  );
+}
+
+async function verifyCurrentCommandExecutionBinding(
+  contract,
+  step,
+) {
+  const binding = validateCommandExecutionBindingShape(contract);
+  const commandValue = step.command || step.cmd;
+  if (!Array.isArray(commandValue) || !commandValue.length ||
+      commandValue.some((item) => typeof item !== "string" || !item)) {
+    throw new Error("Bound command argv is malformed.");
+  }
+  const currentBaseCwd = await fs.realpath(binding.base_cwd);
+  if (currentBaseCwd !== binding.base_cwd) {
+    throw new Error("Command base cwd changed after authorization.");
+  }
+  const expectedCwd = await fs.realpath(
+    step.cwd === undefined
+      ? binding.base_cwd
+      : path.resolve(binding.base_cwd, String(step.cwd)),
+  );
+  if (expectedCwd !== binding.cwd) {
+    throw new Error("Command cwd changed after authorization.");
+  }
+  const environment = buildCommandEnvironment(step);
+  if (canonicalSha256(environment) !== binding.environment_sha256) {
+    throw new Error(
+      "Command child environment changed after authorization.",
+    );
+  }
+  const executablePath = await resolveCurrentCommandExecutable(
+    commandValue[0],
+    binding.cwd,
+    environment,
+  );
+  if (executablePath !== binding.executable.real_path) {
+    throw new Error(
+      "Command executable resolution changed after authorization.",
+    );
+  }
+  const executableIdentity = await stableCommandFileIdentity(
+    executablePath,
+    "executable",
+    true,
+  );
+  if (canonicalJson(executableIdentity) !==
+      canonicalJson(binding.executable)) {
+    throw new Error(
+      "Command executable changed after authorization.",
+    );
+  }
+  const args = commandValue.slice(1).map(String);
+  for (const direct of binding.direct_files) {
+    if (direct.argv_index >= commandValue.length) {
+      throw new Error(
+        "Command direct input argv index is outside the authorized argv.",
+      );
+    }
+    const lexicalPath = path.resolve(
+      binding.cwd,
+      commandValue[direct.argv_index],
+    );
+    if (lexicalPath !== direct.argument_path) {
+      throw new Error(
+        "Command direct input path changed after authorization.",
+      );
+    }
+    const realPath = await fs.realpath(direct.argument_path);
+    if (realPath !== direct.identity.real_path) {
+      throw new Error(
+        "Command direct input target changed after authorization.",
+      );
+    }
+    const currentIdentity = await stableCommandFileIdentity(
+      realPath,
+      "direct_input",
+      false,
+    );
+    if (canonicalJson(currentIdentity) !==
+        canonicalJson(direct.identity)) {
+      throw new Error(
+        "Command direct input changed after authorization.",
+      );
+    }
+    args[direct.argv_index - 1] = direct.identity.real_path;
+  }
+  return {
+    binding_sha256: binding.binding_sha256,
+    command: binding.executable.real_path,
+    args,
+    cwd: binding.cwd,
+    env: environment,
+  };
+}
+
+function executionControlsSha256(
+  rawStep,
+  resolvedStep,
+  contract,
+  ctx,
+  commandDispatch = null,
+) {
+  const trustedSpec = TRUSTED_TOOL_SPECS.get(resolvedStep.action);
+  if (!trustedSpec ||
+      contract.tool_spec_sha256 !== trustedSpec.specSha256 ||
+      contract.idempotent !== trustedSpec.idempotent) {
+    throw new Error(`Resolved invocation has no current trusted ToolSpec: ${resolvedStep.action}.`);
+  }
+  const timeoutEntries = Object.entries(resolvedStep)
+    .filter(([key]) =>
+      /(?:timeout|wait).*ms$/i.test(key) ||
+      (resolvedStep.action === "wait" && key === "ms"))
+    .map(([key, value]) => [key, Number(value)]);
+  for (const [key, value] of timeoutEntries) {
+    if (!Number.isFinite(value) || value < 0 ||
+        value > trustedSpec.maxTimeoutSeconds * 1000) {
+      throw new Error(
+        `Resolved ${key} exceeds the trusted ToolSpec timeout boundary.`,
+      );
+    }
+  }
+  const requestedOutputLimits = [
+    resolvedStep.maxStdoutChars,
+    resolvedStep.maxStderrChars,
+    resolvedStep.maxResponseBodyChars,
+    resolvedStep.maxRequestBodyChars,
+    ctx.maxArtifactChars,
+  ].filter((value) => value !== undefined).map(Number);
+  if (requestedOutputLimits.some((value) =>
+    !Number.isFinite(value) || value < 0 ||
+    value > trustedSpec.outputLimitBytes)) {
+    throw new Error(
+      "Resolved invocation exceeds the trusted ToolSpec output boundary.",
+    );
+  }
+  let processControls = null;
+  if (resolvedStep.action === "command") {
+    if (!commandDispatch) {
+      throw new Error(
+        "Command execution controls require a verified execution binding.",
+      );
+    }
+    processControls = {
+      argv: [commandDispatch.command, ...commandDispatch.args],
+      binding_sha256: commandDispatch.binding_sha256,
+      cwd: commandDispatch.cwd,
+      env_sha256: canonicalSha256(commandDispatch.env),
+      shell: false,
+    };
+  }
+  const networkControls = HIGH_RISK_NETWORK_ACTIONS.has(resolvedStep.action)
+    ? {
+        method: String(resolvedStep.method || "GET").toUpperCase(),
+        url: absoluteHighRiskNetworkTarget(
+          ctx.baseUrl,
+          resolvedStep,
+          `scenario.step.${rawStep.id || ""}`,
+        ),
+        max_redirects: 0,
+      }
+    : null;
+  return canonicalSha256({
+    schema_version: 2,
+    kind: "qa_execution_controls",
+    action: resolvedStep.action,
+    process: processControls,
+    network: networkControls,
+    io_sha256: canonicalSha256({
+      schema_version: 2,
+      kind: "qa_secret_redacted_io_controls",
+      step: structuredSecretRedactedValue(
+        rawStep,
+        resolvedStep,
+        `scenario.step.${rawStep.id || ""}`,
+      ),
+      base_url: structuredSecretRedactedValue(
+        ctx.rawBaseUrl,
+        ctx.baseUrl,
+        "plan.baseUrl",
+      ),
+      default_headers: structuredSecretRedactedValue(
+        ctx.rawDefaultHeaders,
+        ctx.defaultHeaders,
+        "plan.defaultHeaders",
+      ),
+      extra_http_headers: structuredSecretRedactedValue(
+        ctx.rawExtraHTTPHeaders,
+        ctx.extraHTTPHeaders,
+        "plan.extraHTTPHeaders",
+      ),
+    }),
+    timeout_entries: timeoutEntries.sort(
+      ([left], [right]) => left.localeCompare(right),
+    ),
+    output_limit_bytes: trustedSpec.outputLimitBytes,
+    tool_max_timeout_ms: trustedSpec.maxTimeoutSeconds * 1000,
+  });
 }
 
 function parseJsonItems(items) {
@@ -748,6 +2424,7 @@ function buildApiRequest(step, ctx) {
     method,
     headers,
     timeout: step.requestTimeoutMs || step.apiTimeoutMs || step.timeoutMs || 15000,
+    maxRedirects: 0,
   };
   if (step.json !== undefined) {
     requestOptions.data = JSON.stringify(step.json);
@@ -826,16 +2503,32 @@ async function writeTextArtifact(ctx, name, text) {
   return file;
 }
 
-async function runCommand(step, ctx) {
+async function runCommand(step, ctx, verifiedDispatch = null) {
   const timeoutMs = Number(step.timeoutMs || 30000);
   const commandValue = step.command || step.cmd;
   if (!commandValue) throw new Error("command step requires command or cmd.");
 
-  const useShell = step.shell === true || typeof commandValue === "string";
-  const command = Array.isArray(commandValue) ? commandValue[0] : String(commandValue);
-  const args = Array.isArray(commandValue) ? commandValue.slice(1).map(String) : [];
-  const cwd = step.cwd ? path.resolve(String(step.cwd)) : process.cwd();
-  const env = { ...process.env, ...(step.env || {}) };
+  const useShell = verifiedDispatch
+    ? false
+    : step.shell === true || typeof commandValue === "string";
+  const command = verifiedDispatch
+    ? verifiedDispatch.command
+    : Array.isArray(commandValue)
+      ? commandValue[0]
+      : String(commandValue);
+  const args = verifiedDispatch
+    ? verifiedDispatch.args
+    : Array.isArray(commandValue)
+      ? commandValue.slice(1).map(String)
+      : [];
+  const cwd = verifiedDispatch
+    ? verifiedDispatch.cwd
+    : step.cwd
+      ? path.resolve(String(step.cwd))
+      : process.cwd();
+  const env = verifiedDispatch
+    ? verifiedDispatch.env
+    : buildCommandEnvironment(step);
 
   return await new Promise((resolve) => {
     let stdout = "";
@@ -1068,6 +2761,8 @@ async function runSseProbe(page, url, step) {
 
 async function runStep(page, context, scenario, rawStep, ctx) {
   let step = rawStep;
+  let dispatchToken = null;
+  let commandDispatch = null;
   const startedAt = new Date().toISOString();
   const previousStepStartedAt = (ctx.lastStepStartedAtByScenario && ctx.lastStepStartedAtByScenario[scenario.id]) || startedAt;
   if (ctx.lastStepStartedAtByScenario) ctx.lastStepStartedAtByScenario[scenario.id] = startedAt;
@@ -1088,7 +2783,73 @@ async function runStep(page, context, scenario, rawStep, ctx) {
   }
 
   try {
-    step = resolveRuntimeRefs(rawStep, ctx);
+    step = resolveRuntimeRefs(
+      resolveEnvRefs(
+        rawStep,
+        `scenario.${scenario.id}.step.${rawStep.id || ""}`,
+      ),
+      ctx,
+      `scenario.${scenario.id}.step.${rawStep.id || ""}`,
+    );
+    if (!isObject(step) ||
+        step.id !== rawStep.id ||
+        step.action !== rawStep.action) {
+      throw new Error(
+        `Resolved action identity changed for ${scenario.id}/${rawStep.id || ""}.`,
+      );
+    }
+    if (step.action === "command") {
+      validateResolvedCommandBoundary(rawStep, step);
+    }
+    if (HIGH_RISK_NETWORK_ACTIONS.has(step.action)) {
+      for (const field of ["method", "url", "path"]) {
+        if (canonicalSha256(rawStep[field] ?? null) !==
+            canonicalSha256(step[field] ?? null)) {
+          throw new Error(
+            `Resolved high-risk network target field changed dynamically: step.${field}.`,
+          );
+        }
+      }
+      absoluteHighRiskNetworkTarget(
+        ctx.baseUrl,
+        step,
+        `scenario.${scenario.id}.step.${rawStep.id || ""}`,
+      );
+    }
+    const trustedSpec = TRUSTED_TOOL_SPECS.get(step.action);
+    if (!trustedSpec) {
+      throw new Error(
+        `Resolved action is not in the current trusted ToolRegistry: ${step.action}.`,
+      );
+    }
+    const runtimeContract = ctx.actionJournal
+      ? ctx.actionJournal.contract(scenario, rawStep)
+      : {
+          tool_spec_sha256: trustedSpec.specSha256,
+          idempotent: trustedSpec.idempotent,
+        };
+    if (ctx.actionJournal) {
+      if (step.action === "command") {
+        commandDispatch =
+          await verifyCurrentCommandExecutionBinding(
+            runtimeContract,
+            step,
+          );
+      }
+      const controlsSha256 = executionControlsSha256(
+        rawStep,
+        step,
+        runtimeContract,
+        ctx,
+        commandDispatch,
+      );
+      dispatchToken = await ctx.actionJournal.intent(
+        scenario,
+        rawStep,
+        step,
+        controlsSha256,
+      );
+    }
     if (step.action === "goto") {
       const url = resolveUrl(ctx.baseUrl, step, ctx);
       await page.goto(url, { waitUntil: step.waitUntil || "domcontentloaded", timeout: step.timeoutMs || 30000 });
@@ -1338,7 +3099,18 @@ async function runStep(page, context, scenario, rawStep, ctx) {
         record.checkedJson = assertJson(matched, step.expectJson);
       }
     } else if (step.action === "command") {
-      const commandResult = await runCommand(step, ctx);
+      if (ctx.actionJournal) {
+        commandDispatch =
+          await verifyCurrentCommandExecutionBinding(
+            runtimeContract,
+            step,
+          );
+      }
+      const commandResult = await runCommand(
+        step,
+        ctx,
+        commandDispatch,
+      );
       record.exitCode = commandResult.exitCode;
       record.timedOut = !!commandResult.timedOut;
       if (commandResult.error) record.commandError = boundedText(commandResult.error, 500);
@@ -1390,6 +3162,9 @@ async function runStep(page, context, scenario, rawStep, ctx) {
   }
 
   record.finishedAt = new Date().toISOString();
+  if (ctx.actionJournal && dispatchToken) {
+    await ctx.actionJournal.commit(dispatchToken, record.status);
+  }
   return redact(record);
 }
 
@@ -1492,14 +3267,36 @@ async function main() {
 
   const planPath = argValue("--plan");
   const planAuditSummaryPath = argValue("--plan-audit-summary");
+  const agentContextPath = argValue("--agent-context");
+  const actionContractsPath = argValue("--action-contracts");
+  const actionJournalPath = argValue("--action-journal");
   if (!planPath) {
     usage();
     return 2;
   }
 
+  let planInput;
+  let planAuditInput = null;
+  let agentContextInput = null;
+  let rawPlan;
   let plan;
   try {
-    plan = resolveEnvRefs(JSON.parse(await fs.readFile(planPath, "utf-8")));
+    planInput = await readStableJsonInput(planPath, "plan");
+    rawPlan = planInput.value;
+    if (planAuditSummaryPath) {
+      planAuditInput = await readStableJsonInput(
+        planAuditSummaryPath,
+        "plan audit",
+      );
+    }
+    if (agentContextPath) {
+      agentContextInput = await readStableJsonInput(
+        agentContextPath,
+        "agent context",
+      );
+    }
+    validatePlanReferenceBoundary(rawPlan);
+    plan = resolveEnvRefs(rawPlan);
   } catch (error) {
     console.error(`Could not read or resolve plan: ${planPath}`);
     console.error(error.message || String(error));
@@ -1510,20 +3307,24 @@ async function main() {
     return 2;
   }
   try {
-    await validateCommandPlanBinding(plan, planPath, planAuditSummaryPath);
+    await validateCommandPlanBinding(
+      rawPlan,
+      planInput,
+      planAuditInput,
+    );
   } catch (error) {
     console.error("Command plan validation binding failed.");
     console.error(error.message || String(error));
     return 2;
   }
 
-  const needsBrowser = planNeedsBrowser(plan);
-  const needsApiRequest = planNeedsApiRequest(plan);
+  const needsBrowser = planNeedsBrowser(rawPlan);
+  const needsApiRequest = planNeedsApiRequest(rawPlan);
   let chromium;
   let request;
   if (needsBrowser || needsApiRequest) {
     try {
-      ({ chromium, request } = await loadPlaywright(path.resolve(planPath), plan));
+      ({ chromium, request } = await loadPlaywright(planInput.path, plan));
     } catch (error) {
       console.error("Could not import Playwright. Install project dependencies or run from a workspace that has playwright available.");
       console.error(error.message || String(error));
@@ -1531,17 +3332,39 @@ async function main() {
     }
   }
 
-  const artifactDir = path.resolve(plan.artifactDir || path.dirname(planPath));
+  const artifactDir = path.resolve(
+    plan.artifactDir || path.dirname(planInput.path),
+  );
   const screenshotDir = path.join(artifactDir, "screenshots");
   const evidenceDir = path.join(artifactDir, "evidence");
   await ensureDir(screenshotDir);
   await ensureDir(evidenceDir);
+  if (!!actionContractsPath !== !!actionJournalPath) {
+    console.error("--action-contracts and --action-journal must be provided together.");
+    return 2;
+  }
+  let actionJournal = null;
+  if (actionContractsPath && actionJournalPath) {
+    try {
+      actionJournal = await DurableActionJournal.open(
+        path.resolve(actionJournalPath),
+        path.resolve(actionContractsPath),
+        planInput,
+        planAuditInput,
+        agentContextInput,
+      );
+    } catch (error) {
+      console.error("Action dispatch recovery boundary failed closed.");
+      console.error(error.message || String(error));
+      return 3;
+    }
+  }
 
   const startedAt = new Date();
   const runtimeVars = buildRuntimeVars(plan, startedAt);
   const result = {
     schemaVersion: 2,
-    planPath: path.resolve(planPath),
+    planPath: planInput.path,
     artifactDir,
     baseUrl: plan.baseUrl,
     startedAt: startedAt.toISOString(),
@@ -1619,21 +3442,27 @@ async function main() {
 
   const ctx = {
     baseUrl: plan.baseUrl || "",
+    rawBaseUrl: rawPlan.baseUrl,
     defaultHeaders: plan.defaultHeaders || {},
+    rawDefaultHeaders: rawPlan.defaultHeaders || {},
+    extraHTTPHeaders: plan.extraHTTPHeaders || {},
+    rawExtraHTTPHeaders: rawPlan.extraHTTPHeaders || {},
     screenshotDir,
     evidenceDir,
     maxArtifactChars: Number(plan.maxArtifactChars || 10000),
     result,
     vars: runtimeVars,
     lastStepStartedAtByScenario: Object.create(null),
+    actionJournal,
   };
 
-  for (const scenario of plan.scenarios || []) {
+  for (const scenario of rawPlan.scenarios || []) {
     const scenarioResult = { id: scenario.id, title: scenario.title || scenario.id, steps: [] };
     let stopNormalSteps = false;
     for (const step of scenario.steps || []) {
       const alwaysRun = step.alwaysRun === true || step.action === "cleanupApi";
       if (stopNormalSteps && !alwaysRun) {
+        if (actionJournal) await actionJournal.skipped(scenario, step);
         scenarioResult.steps.push(skippedStepRecord(scenario, step, "Skipped because an earlier scenario step failed and continueOnFailure was not enabled."));
         continue;
       }
@@ -1659,6 +3488,7 @@ async function main() {
   } else if (context?.request) {
     await context.request.dispose();
   }
+  if (actionJournal) await actionJournal.close();
 
   const resultPath = path.join(artifactDir, "results.json");
   await fs.writeFile(resultPath, JSON.stringify(redact(result), null, 2), "utf-8");

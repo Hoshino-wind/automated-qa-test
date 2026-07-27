@@ -521,8 +521,34 @@ def _validated_payload(
             )
         return result
     if event_type is RunEventType.PHASE_CHANGED:
-        _reject_unknown_fields(payload, {"phase"})
-        return {"phase": _non_empty_text("payload.phase", payload.get("phase"))}
+        _reject_unknown_fields(
+            payload,
+            {"phase", "trace_required", "command_sha256"},
+        )
+        result = {
+            "phase": _non_empty_text(
+                "payload.phase",
+                payload.get("phase"),
+            )
+        }
+        if "trace_required" in payload:
+            if type(payload["trace_required"]) is not bool:
+                raise TypeError("payload.trace_required must be boolean")
+            result["trace_required"] = payload["trace_required"]
+        if "command_sha256" in payload:
+            result["command_sha256"] = _sha256_text(
+                "payload.command_sha256",
+                payload["command_sha256"],
+            )
+        if result.get("trace_required") is True and "command_sha256" not in result:
+            raise ValueError(
+                "payload.command_sha256 is required when trace_required=true"
+            )
+        if "command_sha256" in result and result.get("trace_required") is not True:
+            raise ValueError(
+                "payload.command_sha256 requires trace_required=true"
+            )
+        return result
     if event_type in {
         RunEventType.FACT_RECORDED,
         RunEventType.ASSUMPTION_RECORDED,

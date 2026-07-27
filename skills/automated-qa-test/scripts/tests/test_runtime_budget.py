@@ -69,6 +69,43 @@ class RunBudgetTests(unittest.TestCase):
         self.assertEqual(probe.remaining_time(), 1.0)
         self.assertEqual(report.remaining_time(), 16.0)
 
+    def test_stage_deadline_reserve_preserves_cleanup_time(self) -> None:
+        clock = FakeClock(10.0)
+        budget = RunBudget(total_timeout=20.0, clock=clock)
+        work = budget.stage("probe", deadline_reserve=4.0)
+
+        self.assertEqual(work.deadline, 26.0)
+        clock.advance(16.0)
+        with self.assertRaises(BudgetExceeded) as caught:
+            work.check()
+
+        self.assertEqual(
+            caught.exception.reason,
+            BudgetReason.DEADLINE_EXCEEDED,
+        )
+        self.assertEqual(budget.remaining_time(), 4.0)
+        self.assertIn("reserved 4.0 seconds", caught.exception.detail)
+        budget.stage("service_runtime_stop").check()
+
+    def test_stage_output_reserve_preserves_cleanup_bytes(self) -> None:
+        budget = RunBudget(
+            max_output_bytes=100,
+            clock=FakeClock(),
+        )
+        work = budget.stage("probe", output_byte_reserve=20)
+
+        self.assertEqual(work.consume_output(80), 80)
+        with self.assertRaises(BudgetExceeded) as caught:
+            work.consume_output(1)
+
+        self.assertEqual(
+            caught.exception.reason,
+            BudgetReason.OUTPUT_BYTE_LIMIT,
+        )
+        self.assertEqual(caught.exception.limit, 80)
+        cleanup = budget.stage("service_runtime_stop")
+        self.assertEqual(cleanup.consume_output(20), 100)
+
     def test_default_stage_timeout_covers_unregistered_stage_names(self) -> None:
         clock = FakeClock()
         budget = RunBudget(

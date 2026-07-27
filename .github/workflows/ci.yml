@@ -21,7 +21,7 @@ jobs:
           node-version: "20"
           cache: npm
       - run: npm ci
-      - run: python3 -m pip install ruff==0.15.22
+      - run: python3 -m pip install "cryptography>=47,<48" ruff==0.15.22
       - run: python3 -m ruff check skills/automated-qa-test/scripts
       - run: python3 -m compileall -q skills/automated-qa-test/scripts
       - run: npm test
@@ -39,5 +39,6 @@ jobs:
           node-version: "20"
           cache: npm
       - run: npm ci
+      - run: python3 -m pip install "cryptography>=47,<48"
       - run: npx playwright install --with-deps chromium
       - run: npm run test:regression

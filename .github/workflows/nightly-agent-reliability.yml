@@ -1,0 +1,103 @@
+name: Nightly Agent Reliability
+
+on:
+  # GitHub Actions cron 使用 UTC，对应北京时间 02:23。
+  schedule:
+    - cron: "23 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-agent-reliability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  define-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: matrix
+        run: >-
+          python3 skills/automated-qa-test/scripts/nightly_agent_matrix.py
+          --repo-root "${GITHUB_WORKSPACE}"
+          --out artifacts/nightly/matrix-definition.json
+          --github-output "${GITHUB_OUTPUT}"
+      - name: Retain the resolved capability matrix
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-agent-matrix
+          path: artifacts/nightly/matrix-definition.json
+          if-no-files-found: error
+          retention-days: 14
+
+  reliability:
+    needs: define-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.define-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: python3 -m pip install "cryptography>=47,<48"
+      - run: npm ci
+      - name: Install pinned Chromium
+        if: matrix.requires_chromium
+        run: npx playwright install --with-deps chromium
+      - name: Prepare bounded artifacts
+        run: mkdir -p artifacts/nightly
+
+      # 命令只按已检入的 id 分发；matrix command 仅供审计，不会作为任意 shell 字符串执行。
+      - name: Full deterministic regression
+        if: matrix.id == 'full-regression'
+        run: >-
+          python3 skills/automated-qa-test/scripts/regression_check.py
+          > artifacts/nightly/full-regression.log 2>&1
+      - name: Full Chromium regression
+        if: matrix.id == 'chromium-regression'
+        run: >-
+          python3 skills/automated-qa-test/scripts/regression_check.py
+          --with-browser
+          > artifacts/nightly/chromium-regression.log 2>&1
+      - name: Offline fail-closed fault injection
+        if: matrix.id == 'fault-injection'
+        run: >-
+          python3 skills/automated-qa-test/scripts/nightly_fault_injection.py
+          --out artifacts/nightly/fault-injection.json
+          > artifacts/nightly/fault-injection.log 2>&1
+      - name: Optional browser-policy benchmark
+        if: matrix.id == 'browser-policy-benchmark'
+        run: >-
+          python3 scripts/run_browser_policy_benchmark.py
+          > artifacts/nightly/browser-policy-benchmark.log 2>&1
+      - name: Optional component-surface verifier
+        if: matrix.id == 'component-surface-verifier'
+        run: >-
+          node scripts/run_component_surface_verifier_benchmark.cjs
+          > artifacts/nightly/component-surface-verifier.log 2>&1
+      - name: Optional component-resilience verifier
+        if: matrix.id == 'component-resilience-verifier'
+        run: >-
+          node scripts/run_component_resilience_verifier_benchmark.cjs
+          > artifacts/nightly/component-resilience-verifier.log 2>&1
+
+      - name: Retain nightly diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-${{ matrix.id }}-${{ github.run_attempt }}
+          path: artifacts/nightly
+          if-no-files-found: error
+          retention-days: 14

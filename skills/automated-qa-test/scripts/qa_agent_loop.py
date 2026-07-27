@@ -1224,6 +1224,41 @@ def arg_list(args: argparse.Namespace, name: str) -> list[Any]:
     return [value]
 
 
+def append_cycle_identity_and_control_options(
+    cmd: list[str],
+    args: argparse.Namespace,
+) -> None:
+    """Preserve proof identity, knowledge, and human-control inputs."""
+
+    for flag, name in (
+        (
+            "--candidate-identity-registration",
+            "candidate_identity_registration",
+        ),
+        ("--agent-bundle-dir", "agent_bundle_dir"),
+        ("--candidate-policy", "candidate_policy"),
+        ("--candidate-memory-snapshot", "candidate_memory_snapshot"),
+        ("--candidate-model-id", "candidate_model_id"),
+        ("--human-authorization", "human_authorization"),
+        ("--knowledge-store", "knowledge_store"),
+        ("--knowledge-trust-config", "knowledge_trust_config"),
+        ("--knowledge-journal-mode", "knowledge_journal_mode"),
+        ("--knowledge-checkpoint", "knowledge_checkpoint"),
+        ("--human-control-store", "human_control_store"),
+        (
+            "--human-control-trust-config",
+            "human_control_trust_config",
+        ),
+        ("--human-control-journal-mode", "human_control_journal_mode"),
+        ("--human-control-checkpoint", "human_control_checkpoint"),
+        ("--human-request-ttl-seconds", "human_request_ttl_seconds"),
+        ("--human-execution-epoch", "human_execution_epoch"),
+    ):
+        option(cmd, flag, arg_value(args, name))
+    for scope in arg_list(args, "knowledge_scope"):
+        cmd.extend(["--knowledge-scope", str(scope)])
+
+
 def as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -3486,6 +3521,7 @@ def resume_loop_command(
         option(cmd, flag, value)
     for service_id in arg_list(args, "required_service"):
         cmd.extend(["--required-service", str(service_id)])
+    append_cycle_identity_and_control_options(cmd, args)
     return cmd
 
 
@@ -3956,6 +3992,7 @@ def build_cycle_cmd(
     option(cmd, "--data-boundary-status", args.data_boundary_status)
     for service_id in args.required_service or []:
         cmd.extend(["--required-service", service_id])
+    append_cycle_identity_and_control_options(cmd, args)
     cmd.extend(["--service-start-timeout", str(args.service_start_timeout)])
     (
         total_timeout,
@@ -4973,6 +5010,39 @@ def _main() -> int:
     parser.add_argument("--session-detail-path")
     parser.add_argument("--persistence-command")
     parser.add_argument("--required-service", action="append")
+    parser.add_argument("--candidate-identity-registration")
+    parser.add_argument("--agent-bundle-dir")
+    parser.add_argument("--candidate-policy")
+    parser.add_argument("--candidate-memory-snapshot")
+    parser.add_argument("--candidate-model-id")
+    parser.add_argument("--human-authorization")
+    parser.add_argument("--knowledge-store")
+    parser.add_argument("--knowledge-trust-config")
+    parser.add_argument("--knowledge-scope", action="append")
+    parser.add_argument(
+        "--knowledge-journal-mode",
+        choices=("local-test", "production"),
+        default="local-test",
+    )
+    parser.add_argument("--knowledge-checkpoint")
+    parser.add_argument("--human-control-store")
+    parser.add_argument("--human-control-trust-config")
+    parser.add_argument(
+        "--human-control-journal-mode",
+        choices=("local-test", "production"),
+        default="local-test",
+    )
+    parser.add_argument("--human-control-checkpoint")
+    parser.add_argument(
+        "--human-request-ttl-seconds",
+        type=positive_float_arg,
+        default=24 * 60 * 60,
+    )
+    parser.add_argument(
+        "--human-execution-epoch",
+        type=positive_int_arg,
+        default=1,
+    )
     parser.add_argument("--summary", help="Defaults to <run-dir>/qa-agent-summary.json")
     args = parser.parse_args()
 

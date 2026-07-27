@@ -79,6 +79,23 @@ class CycleOptions:
     max_probes: int
     max_output_bytes: int
     termination_grace_seconds: float
+    candidate_identity_registration: str | None = None
+    agent_bundle_dir: str | None = None
+    candidate_policy: str | None = None
+    candidate_memory_snapshot: str | None = None
+    candidate_model_id: str | None = None
+    human_authorization: str | None = None
+    knowledge_store: str | None = None
+    knowledge_trust_config: str | None = None
+    knowledge_scope: list[str] | None = None
+    knowledge_journal_mode: str = "local-test"
+    knowledge_checkpoint: str | None = None
+    human_control_store: str | None = None
+    human_control_trust_config: str | None = None
+    human_control_journal_mode: str = "local-test"
+    human_control_checkpoint: str | None = None
+    human_request_ttl_seconds: float = 24 * 60 * 60
+    human_execution_epoch: int = 1
 
 
 def build_cycle_parser() -> argparse.ArgumentParser:
@@ -176,6 +193,87 @@ def build_cycle_parser() -> argparse.ArgumentParser:
         type=_non_negative_float,
         default=DEFAULT_TERMINATION_GRACE_SECONDS,
         help="TERM-to-KILL grace period for a timed out or cancelled process group.",
+    )
+    parser.add_argument(
+        "--candidate-identity-registration",
+        help=(
+            "Pre-registered candidate identity JSON. Requires all candidate "
+            "source flags and is verified before any QA stage dispatch."
+        ),
+    )
+    parser.add_argument(
+        "--agent-bundle-dir",
+        help="Bounded regular-file tree whose digest identifies the agent bundle.",
+    )
+    parser.add_argument(
+        "--candidate-policy",
+        help="Bounded single-link JSON policy snapshot.",
+    )
+    parser.add_argument(
+        "--candidate-memory-snapshot",
+        help="Bounded single-link JSON memory snapshot.",
+    )
+    parser.add_argument(
+        "--candidate-model-id",
+        help="Exact model identifier bound into the candidate identity.",
+    )
+    parser.add_argument(
+        "--human-authorization",
+        help="Defaults to <run-dir>/human-authorization.json.",
+    )
+    parser.add_argument(
+        "--knowledge-store",
+        help="Confirmed KnowledgeStore directory to include in ContextSnapshot.",
+    )
+    parser.add_argument(
+        "--knowledge-trust-config",
+        help="Public Ed25519 trust allowlist for KnowledgeStore replay.",
+    )
+    parser.add_argument(
+        "--knowledge-scope",
+        action="append",
+        help="Exact knowledge scope dimension; may be repeated.",
+    )
+    parser.add_argument(
+        "--knowledge-journal-mode",
+        choices=("local-test", "production"),
+        default="local-test",
+    )
+    parser.add_argument(
+        "--knowledge-checkpoint",
+        help="Independent signed production KnowledgeStore checkpoint.",
+    )
+    parser.add_argument(
+        "--human-control-store",
+        help="HITLStore directory used to gate high-risk ToolSpec actions.",
+    )
+    parser.add_argument(
+        "--human-control-trust-config",
+        help="Public Ed25519 approval/checkpoint trust allowlist.",
+    )
+    parser.add_argument(
+        "--human-control-journal-mode",
+        choices=("local-test", "production"),
+        default="local-test",
+    )
+    parser.add_argument(
+        "--human-control-checkpoint",
+        help="Independent signed production HITL checkpoint.",
+    )
+    parser.add_argument(
+        "--human-request-ttl-seconds",
+        type=_positive_float,
+        default=24 * 60 * 60,
+        help="Validity window for a newly created high-risk HITL request.",
+    )
+    parser.add_argument(
+        "--human-execution-epoch",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Manual high-risk recovery epoch. Increment only after "
+            "reconciling the prior execution intent."
+        ),
     )
     return parser
 

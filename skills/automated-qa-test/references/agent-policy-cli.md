@@ -78,6 +78,8 @@ python3 scripts/agent_policy_cli.py validate \
   --probe-id P1 \
   --context-sha256 "<current-context-sha256>" \
   --state-sha256 "<current-state-sha256>" \
+  --model-id "planner-model@version" \
+  --evidence-ref "requirement.md#R1" \
   --grant isolated_test_environment \
   --max-risk low \
   --total-timeout 60 \
@@ -93,8 +95,10 @@ python3 scripts/agent_policy_cli.py validate \
 - 使用 `--max-risk high`；
 - 同时保留 `--grant isolated_test_environment`。
 
-CLI 依次检查 proposal schema、当前 context/state/registry 哈希、ToolInvocation、风险、权限、
-ToolSpec timeout/output 上限和 RunBudget。只有全部通过，decision 才包含
+CLI 依次检查 proposal schema、调用方选择的精确 model id、调用方注入的 evidence ref
+allowlist、当前 context/state/registry 哈希、ToolInvocation、风险、权限、ToolSpec
+timeout/output 上限和 RunBudget。假设与探针只能引用顶层 proposal 已声明且位于
+allowlist 中的来源。只有全部通过，decision 才包含
 `ExecutionAuthorization`。
 
 `validate` 只检查预算快照，不消费额度；实际 executor 在执行前仍必须原子预留 probe、
@@ -111,6 +115,8 @@ python3 scripts/agent_policy_cli.py verify \
   --authorization-file /tmp/goto-authorization.json \
   --context-sha256 "<current-context-sha256>" \
   --state-sha256 "<current-state-sha256>" \
+  --model-id "planner-model@version" \
+  --evidence-ref "requirement.md#R1" \
   --policy-version qa-default-policy@1 \
   --out /tmp/goto-verification.json
 ```

@@ -1,9 +1,12 @@
-"""受约束 Planner/Critic 与确定性 Policy 公共接口。"""
+"""受约束 Planner/Diagnostician/Critic 与确定性 Policy 公共接口。"""
 
 from .contracts import (
     AgentContractError,
     CriticRecommendation,
     CriticReview,
+    DiagnosisFinding,
+    DiagnosisProposal,
+    DiagnosisStatus,
     Hypothesis,
     PlanProposal,
     ProbeProposal,
@@ -19,6 +22,9 @@ __all__ = [
     "AgentContractError",
     "CriticRecommendation",
     "CriticReview",
+    "DiagnosisFinding",
+    "DiagnosisProposal",
+    "DiagnosisStatus",
     "DeterministicPolicyEngine",
     "ExecutionAuthorization",
     "Hypothesis",

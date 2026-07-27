@@ -14,6 +14,8 @@ from qa_core.agent import (  # noqa: E402
     CriticRecommendation,
     CriticReview,
     DeterministicPolicyEngine,
+    DiagnosisProposal,
+    DiagnosisStatus,
     ExecutionAuthorization,
     PlanProposal,
 )
@@ -29,6 +31,11 @@ from qa_core.tools import (  # noqa: E402
 CONTEXT_SHA256 = "a" * 64
 STATE_SHA256 = "b" * 64
 HMAC_KEY = b"policy-test-key-with-at-least-32-bytes"
+PLANNER_MODEL_ID = "planner-model@2026-07"
+CRITIC_MODEL_ID = "critic-model@2026-07"
+DIAGNOSIS_MODEL_ID = "diagnostician-model@2026-07"
+PLAN_EVIDENCE_REFS = ("requirement.md#R1",)
+DIAGNOSIS_EVIDENCE_REFS = ("agent-trace.jsonl#event-4",)
 
 
 class FakeClock:
@@ -130,6 +137,8 @@ def make_plan(registry: ToolRegistry) -> PlanProposal:
     return PlanProposal.from_model_input(
         plan_payload(registry),
         registry=registry,
+        expected_model_id=PLANNER_MODEL_ID,
+        allowed_evidence_refs=PLAN_EVIDENCE_REFS,
     )
 
 
@@ -189,6 +198,7 @@ class AgentProposalContractTests(unittest.TestCase):
             plan.hypotheses[0].evidence_refs,
             ("requirement.md#R1",),
         )
+        self.assertTrue(plan.to_dict()["not_authorization"])
         self.assertEqual(len(plan.canonical_sha256), 64)
         self.assertEqual(len(probe.canonical_sha256), 64)
 
@@ -199,6 +209,8 @@ class AgentProposalContractTests(unittest.TestCase):
             PlanProposal.from_model_input(
                 unknown,
                 registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
             )
         self.assertEqual(
             unknown_error.exception.code,
@@ -211,6 +223,8 @@ class AgentProposalContractTests(unittest.TestCase):
             PlanProposal.from_model_input(
                 forbidden,
                 registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
             )
         self.assertEqual(
             authority_error.exception.code,
@@ -223,6 +237,8 @@ class AgentProposalContractTests(unittest.TestCase):
             PlanProposal.from_model_input(
                 nested_shell,
                 registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
             )
         self.assertEqual(
             shell_error.exception.code,
@@ -235,6 +251,8 @@ class AgentProposalContractTests(unittest.TestCase):
             PlanProposal.from_model_input(
                 wrong_array,
                 registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
             )
         self.assertEqual(
             array_error.exception.code,
@@ -249,9 +267,49 @@ class AgentProposalContractTests(unittest.TestCase):
             PlanProposal.from_model_input(
                 payload,
                 registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
             )
 
         self.assertEqual(caught.exception.code, "hypothesis_ref_unknown")
+
+    def test_plan_model_and_evidence_sources_are_out_of_band_bound(
+        self,
+    ) -> None:
+        wrong_model = plan_payload(self.registry)
+        wrong_model["model_id"] = "untrusted-planner"
+        wrong_model["probes"][0]["model_id"] = "untrusted-planner"
+        with self.assertRaises(AgentContractError) as model_error:
+            PlanProposal.from_model_input(
+                wrong_model,
+                registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            model_error.exception.code,
+            "proposal_model_id_drift",
+        )
+
+        invented_source = plan_payload(self.registry)
+        invented_source["evidence_refs"] = ["model-memory://claim"]
+        invented_source["hypotheses"][0]["evidence_refs"] = [
+            "model-memory://claim"
+        ]
+        invented_source["probes"][0]["evidence_refs"] = [
+            "model-memory://claim"
+        ]
+        with self.assertRaises(AgentContractError) as evidence_error:
+            PlanProposal.from_model_input(
+                invented_source,
+                registry=self.registry,
+                expected_model_id=PLANNER_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            evidence_error.exception.code,
+            "evidence_ref_untrusted",
+        )
 
     def test_critic_review_is_strict_and_has_no_approval_authority(self) -> None:
         plan = make_plan(self.registry)
@@ -262,12 +320,15 @@ class AgentProposalContractTests(unittest.TestCase):
                 "context_sha256": CONTEXT_SHA256,
                 "state_sha256": STATE_SHA256,
                 "tool_registry_sha256": self.registry.canonical_sha256,
-                "model_id": "critic-model@2026-07",
+                "model_id": CRITIC_MODEL_ID,
                 "recommendation": "revise",
                 "hypothesis_ids": ["H1"],
                 "evidence_refs": ["requirement.md#R1"],
                 "findings": ["需要补充 API 请求序列证据"],
             },
+            plan=plan,
+            expected_model_id=CRITIC_MODEL_ID,
+            allowed_evidence_refs=PLAN_EVIDENCE_REFS,
         )
 
         self.assertEqual(
@@ -275,14 +336,167 @@ class AgentProposalContractTests(unittest.TestCase):
             CriticRecommendation.REVISE,
         )
         self.assertFalse(hasattr(review, "authorization"))
+        self.assertTrue(review.to_dict()["not_authorization"])
 
         payload = review.to_dict()
         payload["signature"] = "forged"
         with self.assertRaises(AgentContractError) as caught:
-            CriticReview.from_model_input(payload)
+            CriticReview.from_model_input(
+                payload,
+                plan=plan,
+                expected_model_id=CRITIC_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
+            )
         self.assertEqual(
             caught.exception.code,
             "model_field_forbidden",
+        )
+
+        critic_payload = {
+            "review_id": "review-untrusted",
+            "plan_sha256": plan.canonical_sha256,
+            "context_sha256": CONTEXT_SHA256,
+            "state_sha256": STATE_SHA256,
+            "tool_registry_sha256": self.registry.canonical_sha256,
+            "model_id": CRITIC_MODEL_ID,
+            "recommendation": "stop",
+            "hypothesis_ids": ["H1"],
+            "evidence_refs": ["model-memory://claim"],
+            "findings": ["来源未由调用方注入"],
+        }
+        with self.assertRaises(AgentContractError) as evidence_error:
+            CriticReview.from_model_input(
+                critic_payload,
+                plan=plan,
+                expected_model_id=CRITIC_MODEL_ID,
+                allowed_evidence_refs=PLAN_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            evidence_error.exception.code,
+            "evidence_ref_untrusted",
+        )
+
+    def test_diagnostician_is_bound_and_cannot_invent_actions(self) -> None:
+        plan = make_plan(self.registry)
+        payload = {
+            "diagnosis_id": "diagnosis-1",
+            "plan_sha256": plan.canonical_sha256,
+            "context_sha256": CONTEXT_SHA256,
+            "state_sha256": STATE_SHA256,
+            "tool_registry_sha256": self.registry.canonical_sha256,
+            "trace_sha256": "c" * 64,
+            "model_id": DIAGNOSIS_MODEL_ID,
+            "findings": [
+                {
+                    "hypothesis_id": "H1",
+                    "status": "supported",
+                    "explanation": (
+                        "当前 trace 显示请求序列需要继续验证"
+                    ),
+                    "evidence_refs": ["agent-trace.jsonl#event-4"],
+                    "recommended_probe_ids": ["P1"],
+                }
+            ],
+            "unknowns": ["服务端幂等键是否持久化"],
+        }
+
+        diagnosis = DiagnosisProposal.from_model_input(
+            payload,
+            plan=plan,
+            expected_trace_sha256="c" * 64,
+            expected_model_id=DIAGNOSIS_MODEL_ID,
+            allowed_evidence_refs=DIAGNOSIS_EVIDENCE_REFS,
+        )
+
+        self.assertEqual(
+            diagnosis.findings[0].status,
+            DiagnosisStatus.SUPPORTED,
+        )
+        self.assertEqual(
+            diagnosis.findings[0].recommended_probe_ids,
+            ("P1",),
+        )
+        self.assertFalse(hasattr(diagnosis, "authorization"))
+        self.assertTrue(diagnosis.to_dict()["not_authorization"])
+        self.assertEqual(len(diagnosis.canonical_sha256), 64)
+
+        stale = copy.deepcopy(payload)
+        stale["plan_sha256"] = "d" * 64
+        with self.assertRaises(AgentContractError) as stale_error:
+            DiagnosisProposal.from_model_input(
+                stale,
+                plan=plan,
+                expected_trace_sha256="c" * 64,
+                expected_model_id=DIAGNOSIS_MODEL_ID,
+                allowed_evidence_refs=DIAGNOSIS_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            stale_error.exception.code,
+            "diagnosis_binding_drift",
+        )
+
+        trace_drift = copy.deepcopy(payload)
+        trace_drift["trace_sha256"] = "e" * 64
+        with self.assertRaises(AgentContractError) as trace_error:
+            DiagnosisProposal.from_model_input(
+                trace_drift,
+                plan=plan,
+                expected_trace_sha256="c" * 64,
+                expected_model_id=DIAGNOSIS_MODEL_ID,
+                allowed_evidence_refs=DIAGNOSIS_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            trace_error.exception.code,
+            "diagnosis_binding_drift",
+        )
+
+        invented = copy.deepcopy(payload)
+        invented["findings"][0]["recommended_probe_ids"] = [
+            "invented-probe"
+        ]
+        with self.assertRaises(AgentContractError) as probe_error:
+            DiagnosisProposal.from_model_input(
+                invented,
+                plan=plan,
+                expected_trace_sha256="c" * 64,
+                expected_model_id=DIAGNOSIS_MODEL_ID,
+                allowed_evidence_refs=DIAGNOSIS_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            probe_error.exception.code,
+            "diagnosis_probe_unknown",
+        )
+
+        privileged = copy.deepcopy(payload)
+        privileged["findings"][0]["authorization"] = "approved"
+        with self.assertRaises(AgentContractError) as authority_error:
+            DiagnosisProposal.from_model_input(
+                privileged,
+                plan=plan,
+                expected_trace_sha256="c" * 64,
+                expected_model_id=DIAGNOSIS_MODEL_ID,
+                allowed_evidence_refs=DIAGNOSIS_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            authority_error.exception.code,
+            "model_field_forbidden",
+        )
+
+        untrusted_evidence = copy.deepcopy(payload)
+        untrusted_evidence["findings"][0]["evidence_refs"] = [
+            "model-memory://claim"
+        ]
+        with self.assertRaises(AgentContractError) as evidence_error:
+            DiagnosisProposal.from_model_input(
+                untrusted_evidence,
+                plan=plan,
+                expected_trace_sha256="c" * 64,
+                expected_model_id=DIAGNOSIS_MODEL_ID,
+                allowed_evidence_refs=DIAGNOSIS_EVIDENCE_REFS,
+            )
+        self.assertEqual(
+            evidence_error.exception.code,
+            "evidence_ref_untrusted",
         )
 
 

@@ -24,15 +24,33 @@
 ## 当前事实
 
 - 正常执行入口是 `skills/automated-qa-test/scripts/run_qa_cycle.py`；它串联需求覆盖、
-  预检、Adapter、计划、探针、证据和结论阶段。
+  预检、Adapter、当前上下文、计划、探针、证据、清理和结论阶段。
 - `skills/automated-qa-test/scripts/qa_agent_loop.py` 在一个 run directory 上执行有界迭代，
-  生成机器可读路由和人类 handoff。
-- 当前规划与路由主要由确定性规则和显式状态分类驱动；v2 文档描述的是目标架构，
-  不是对现有实现已经具备这些能力的声明。
-- `results.json`、`evidence-ledger.json`、审计结果和 verdict 构成通过声明的证据链。
+  共享同一个 `RunBudget` 和 generation-fenced lease，并生成机器可读路由和人类 handoff。
+- 单写 lease、不可变 attempt、追加式 state event journal、当前 context 哈希和
+  `agent-trace.jsonl` 已进入独立 proof graph；摘要和报告仍只是投影。
+- 每个真实探针 action 都从默认 `ToolSpec` registry 派生严格合同，先在
+  `action-journal.jsonl` 落 durable intent，执行后再落 commit。未决非幂等 intent
+  只能转人工 reconciliation。
+- 受约束 Planner、Diagnostician、Critic 和 Scheduler 已提供严格公共合同；
+  Diagnostician 只能更新当前计划中的假设并引用当前 trace/证据，所有输出都只是建议；
+  `not_authorization=true`，并行建议不构成运行时授权。
+- HITL 和跨运行 Knowledge 使用 Ed25519 人工收据、可信时钟、精确 scope/currentness
+  和一次性消费；production journal 还必须验证外部 authority 签名且精确覆盖当前
+  journal 的 anti-rollback checkpoint。未覆盖 tail 不能用于 query/resume/consume，
+  production consume 需经“持久化 prepare—外部 checkpoint—resume 确认”两阶段。
+  Knowledge 始终是 `not_evidence=true`。
+- 生产 SLO 只接受现场重验通过的 run roots。独立 evaluator registration 与联合
+  release admission 已实现，但仓库自身没有外部 held-out corpus、私钥或独立
+  authority，因此不能自证 production qualified。
+- Adapter 严格 onboarding、每日浏览器/非浏览器矩阵和离线故障注入均已形成公开维护
+  合同；它们是工程门禁，不是产品运行证据。
+- `results.json`、`evidence-ledger.json`、审计结果和确定性 verdict 是通过声明的业务
+  证据链；run proof 还必须闭合 state、manifest、attempt、trace、action 和当前输入。
 - 业务模型、Oracle、指标、报告和模型推理可以辅助规划与解释，但它们本身不是运行证据。
 - 合法测试状态是 `Passed`、`Failed`、`Blocked`、`Untested` 和 `Inconclusive`。
-- 当前产物以 run directory 中的 JSON/Markdown 文件为主；历史文件存在不等于本轮有效。
+- `--skip-probe` 仅用于 planning/blocker handoff；它不派发 action、不可形成
+  `can_claim_pass=true`。
 
 ## 事实、假设与待验证命题
 
@@ -52,7 +70,7 @@
 
 ### 待验证命题
 
-- 受约束的 Planner/Critic 能在相同预算内显著提高 held-out 缺陷发现率。
+- 受约束的 Planner/Diagnostician/Critic 能在相同预算内显著提高 held-out 缺陷发现率。
 - 项目语义编译能减少脆弱的需求关键词匹配，同时保持计划可解释性。
 - 人工确认后的跨运行知识能降低重复探索成本，且不会污染证据判定。
 
@@ -67,6 +85,8 @@
 5. 可解释 handoff：无法继续时必须说明阻断层、原因、所需输入和下一安全动作。
 6. 模型与裁决分离：概率推理可以建议，不能直接授权工具或生成可解锁的 `PASS`。
 7. 评测独立：生产候选必须通过与开发语料隔离的 held-out 合同，不能只依赖自编案例。
+8. 外部锚定：生产 HITL/Knowledge 与生产评测所需私钥、语料和 authority 必须位于
+   Agent 写边界之外；本地哈希链或自签结果不能替代外部信任根。
 
 ## 四个不可变式
 
@@ -90,6 +110,9 @@
 模型只能提交 proposal。只有确定性的策略引擎能把 proposal 转为带授权令牌的
 validated plan；执行器拒绝任何未通过策略校验、超出能力或哈希不匹配的动作。
 
+Scheduler、Critic、SLO 报告、评测报告和 P2 release admission 都不得被解释成单个
+工具或 action 的运行时授权。
+
 ## 稳定术语
 
 - **Run**：一次顶层 QA 任务，拥有独立 `run_id`、预算和 lease。
@@ -98,10 +121,35 @@ validated plan；执行器拒绝任何未通过策略校验、超出能力或哈
 - **Proposal**：模型或规则提出、尚未获准执行的计划或增量。
 - **Validated plan**：经 schema、策略、能力和预算校验后可执行的计划。
 - **Receipt**：执行器对实际动作、环境、时间、退出状态和输出哈希的记录。
+- **Action contract**：从当前 plan/context/audit 与 `ToolSpec` 派生的单 action
+  调用、风险、授权和恢复合同。
+- **Action journal**：先 intent、后 commit 的追加式 action dispatch 日志；用于证明
+  派发覆盖和恢复边界。
 - **Evidence**：与 receipt 和当前输入绑定、能够证明或反驳测试断言的观察。
 - **Verdict**：确定性判定器基于已审计证据生成的终局状态。
 - **Projection**：面向人或外部编排器的报告、摘要和 handoff；不是权威状态源。
 - **Proof-carrying claim**：携带 scope、run、输入哈希、证据引用和策略版本的结论。
+- **Release admission**：对“由独立签名 evaluator registration 约束的 production
+  evaluation”与 proof-backed SLO 的派生联合发布门；它自身不是签名凭据，只适用于
+  声明的 P2 release scope，也不是 runtime authorization。
+
+## 当前生产资格边界
+
+当前实现具备 production qualification 所需的验证器和失败关闭门，但没有声称已经获得
+生产资格。真实资格至少需要：
+
+1. Agent 无写权限的 200 scenario × 3 seed held-out corpus、gold oracle 和 deterministic
+   baseline；
+2. 独立 evaluator authority 对 corpus、candidate、baseline、预算、阈值和 SLO input set
+   的 Ed25519 registration；
+3. 来自实际目标环境、逐个得到 `proof_valid=true` 的 run roots；其 outcome 必须为
+   success、failure 或 cancellation-or-timeout，且只有 success 可以
+   `can_claim_pass=true`；
+4. `agent_release_admission.py` 对 evaluation 与 SLO 的现场重算和交叉哈希闭合。
+
+即使 release admission 成功，P2 并行/多 Agent 也只获得发布范围内的资格结论；
+Scheduler/Critic 建议和 admission 都不会自动签发工具授权，现有单 run 单写者约束保持
+不变。
 
 ## 决策优先级
 

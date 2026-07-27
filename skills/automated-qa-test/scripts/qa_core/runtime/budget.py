@@ -169,11 +169,25 @@ class RunBudget:
         with self._lock:
             return self._remaining_at(self._now())
 
-    def stage(self, name: str) -> StageBudget:
+    def stage(
+        self,
+        name: str,
+        *,
+        deadline_reserve: float = 0.0,
+        output_byte_reserve: int = 0,
+    ) -> StageBudget:
         """按配置的 timeout 开始一个阶段预算。"""
 
         if not isinstance(name, str) or not name.strip():
             raise ValueError("stage name must be a non-empty string")
+        normalized_deadline_reserve = _non_negative_float(
+            "deadline_reserve",
+            deadline_reserve,
+        )
+        normalized_output_reserve = _required_non_negative_int(
+            "output_byte_reserve",
+            output_byte_reserve,
+        )
         with self._lock:
             now = self._now()
             self._check_locked(now)
@@ -185,6 +199,8 @@ class RunBudget:
                     name,
                     self._default_stage_timeout,
                 ),
+                deadline_reserve=normalized_deadline_reserve,
+                output_byte_reserve=normalized_output_reserve,
             )
 
     def check(self) -> None:
@@ -264,13 +280,23 @@ class RunBudget:
                 observed=self._cancelled_at,
                 detail=self._cancel_detail,
             )
-        if self._deadline is not None and now >= self._deadline:
+        effective_deadline = self._deadline
+        if effective_deadline is not None and stage is not None:
+            effective_deadline -= stage.deadline_reserve
+        if effective_deadline is not None and now >= effective_deadline:
             raise BudgetExceeded(
                 BudgetReason.DEADLINE_EXCEEDED,
                 snapshot=self._snapshot_locked(now),
                 stage=stage_name,
-                limit=self._deadline,
+                limit=effective_deadline,
                 observed=now,
+                detail=(
+                    f"reserved {stage.deadline_reserve} seconds for "
+                    "mandatory recovery/cleanup"
+                    if stage is not None
+                    and stage.deadline_reserve > 0
+                    else None
+                ),
             )
         if stage and stage.timeout is not None:
             stage_deadline = stage.started_at + stage.timeout
@@ -316,16 +342,29 @@ class RunBudget:
             now = self._now()
             self._check_locked(now, stage)
             attempted = self._output_bytes_used + byte_count
+            effective_limit = self._max_output_bytes
+            if effective_limit is not None and stage is not None:
+                effective_limit = max(
+                    0,
+                    effective_limit - stage.output_byte_reserve,
+                )
             if (
-                self._max_output_bytes is not None
-                and attempted > self._max_output_bytes
+                effective_limit is not None
+                and attempted > effective_limit
             ):
                 raise BudgetExceeded(
                     BudgetReason.OUTPUT_BYTE_LIMIT,
                     snapshot=self._snapshot_locked(now),
                     stage=stage.name if stage else None,
-                    limit=self._max_output_bytes,
+                    limit=effective_limit,
                     observed=attempted,
+                    detail=(
+                        f"reserved {stage.output_byte_reserve} output bytes "
+                        "for mandatory recovery/cleanup"
+                        if stage is not None
+                        and stage.output_byte_reserve > 0
+                        else None
+                    ),
                 )
             self._output_bytes_used = attempted
             return attempted
@@ -339,6 +378,8 @@ class StageBudget:
     name: str
     started_at: float
     timeout: float | None
+    deadline_reserve: float = 0.0
+    output_byte_reserve: int = 0
 
     @property
     def deadline(self) -> float | None:
@@ -348,6 +389,8 @@ class StageBudget:
             else None
         )
         run_deadline = self.parent.deadline
+        if run_deadline is not None:
+            run_deadline -= self.deadline_reserve
         if stage_deadline is None:
             return run_deadline
         if run_deadline is None:

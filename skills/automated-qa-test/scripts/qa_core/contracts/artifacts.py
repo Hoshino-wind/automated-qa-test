@@ -16,9 +16,15 @@ ARTIFACT_FILENAMES = {
     "requirement_coverage": "requirement-coverage.json",
     "plan_audit_summary": "plan-audit-summary.json",
     "adapter_context": "adapter-context.json",
+    "agent_context": "agent-context.json",
+    "human_authorization": "human-authorization.json",
+    "candidate_identity_snapshot": "candidate-identity.json",
+    "action_contracts": "action-contracts.json",
+    "action_journal": "action-journal.jsonl",
     "adapter_probes": "adapter-probes.json",
     "service_preflight": "service-preflight.json",
     "service_runtime": "service-runtime.json",
+    "service_runtime_stop": "service-runtime-stop.json",
     "defects": "defects.json",
     "next_probes": "next-probes.json",
     "next_probe_application": "next-probe-application.json",
@@ -49,9 +55,15 @@ class ArtifactPaths:
     requirement_coverage: Path
     plan_audit_summary: Path
     adapter_context: Path
+    agent_context: Path
+    human_authorization: Path
+    candidate_identity_snapshot: Path
+    action_contracts: Path
+    action_journal: Path
     adapter_probes: Path
     service_preflight: Path
     service_runtime: Path
+    service_runtime_stop: Path
     defects: Path
     next_probes: Path
     next_probe_application: Path
@@ -95,9 +107,15 @@ class ArtifactPaths:
             "closeout_candidates",
             "semantic_artifacts_summary",
             "adapter_context",
+            "agent_context",
+            "human_authorization",
+            "candidate_identity_snapshot",
+            "action_contracts",
+            "action_journal",
             "adapter_probes",
             "service_preflight",
             "service_runtime",
+            "service_runtime_stop",
         }
         result: dict[str, str | None] = {}
         for name in ARTIFACT_FILENAMES:

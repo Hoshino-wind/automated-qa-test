@@ -2524,7 +2524,7 @@ def copy_script_runtime(script_dir: Path, target_dir: Path) -> None:
     for source in script_dir.iterdir():
         if source.is_file() and source.suffix in {".py", ".mjs"}:
             shutil.copy2(source, target_dir / source.name)
-    for package_name in ("qa_core", "qa_scaffold"):
+    for package_name in ("qa_core", "qa_eval", "qa_scaffold"):
         shutil.copytree(script_dir / package_name, target_dir / package_name, dirs_exist_ok=True)
     shutil.copytree(script_dir.parent / "references" / "schemas", target_dir.parent / "references" / "schemas", dirs_exist_ok=True)
 

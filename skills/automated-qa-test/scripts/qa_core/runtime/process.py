@@ -58,6 +58,8 @@ class ProcessExecutor:
         poll_interval: float = 0.05,
         termination_grace: float = 1.0,
         read_size: int = 16 * 1024,
+        deadline_reserve: float = 0.0,
+        output_byte_reserve: int = 0,
     ) -> None:
         if not isinstance(budget, RunBudget):
             raise TypeError("budget must be a RunBudget")
@@ -72,6 +74,14 @@ class ProcessExecutor:
             termination_grace,
         )
         self.read_size = _positive_int("read_size", read_size)
+        self.deadline_reserve = _non_negative_float(
+            "deadline_reserve",
+            deadline_reserve,
+        )
+        self.output_byte_reserve = _non_negative_int(
+            "output_byte_reserve",
+            output_byte_reserve,
+        )
 
     def run(
         self,
@@ -89,7 +99,11 @@ class ProcessExecutor:
         started_monotonic = time.monotonic()
         started_at = _iso_timestamp()
         try:
-            stage_budget = self.budget.stage(self.stage)
+            stage_budget = self.budget.stage(
+                self.stage,
+                deadline_reserve=self.deadline_reserve,
+                output_byte_reserve=self.output_byte_reserve,
+            )
             stage_budget.check()
             if normalized_probe_count > 0:
                 stage_budget.consume_probe(normalized_probe_count)

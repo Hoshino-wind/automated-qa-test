@@ -976,6 +976,8 @@ def run_required_artifact_unreadable_fixture(script_dir: Path, tmp_path: Path) -
                 str(case_dir),
                 "--skip-probe",
                 "--skip-report",
+                "--allow-unconfirmed-environment",
+                "--allow-missing-requirement-coverage",
             ],
             cwd=str(case_dir),
             text=True,
@@ -1060,6 +1062,8 @@ def run_skip_probe_unreadable_results_fixture(script_dir: Path, tmp_path: Path) 
                 str(case_dir),
                 "--skip-probe",
                 "--skip-report",
+                "--allow-unconfirmed-environment",
+                "--allow-missing-requirement-coverage",
             ],
             cwd=str(case_dir),
             text=True,
@@ -1304,8 +1308,10 @@ def run_agent_service_start_next_action_fixture(script_dir: Path, tmp_path: Path
 def run_agent_authorized_service_start_fixture(script_dir: Path, tmp_path: Path) -> None:
     start_dir = tmp_path / "agent-authorized-service-start"
     start_dir.mkdir(parents=True, exist_ok=True)
+    project_root = start_dir / "project"
+    project_root.mkdir()
     (start_dir / "requirement.md").write_text("- The fixture API health endpoint is reachable after service startup.\n", encoding="utf-8")
-    (start_dir / "index.html").write_text("authorized service start fixture\n", encoding="utf-8")
+    (project_root / "index.html").write_text("authorized service start fixture\n", encoding="utf-8")
     port = unused_tcp_port()
     base_url = f"http://127.0.0.1:{port}"
     write_json(
@@ -1363,7 +1369,7 @@ def run_agent_authorized_service_start_fixture(script_dir: Path, tmp_path: Path)
         {
             "schema_version": 1,
             "adapter": "fixture",
-            "project_root": str(start_dir),
+            "project_root": str(project_root),
             "base_url": base_url,
             "environment_boundary": {
                 "runtime_mode": "test",
@@ -1396,7 +1402,7 @@ def run_agent_authorized_service_start_fixture(script_dir: Path, tmp_path: Path)
                 "--required-service",
                 "fixture-api",
                 "--project-root",
-                str(start_dir),
+                str(project_root),
                 "--runtime-mode",
                 "test",
                 "--data-boundary-status",
@@ -1782,6 +1788,9 @@ def run_agent_repeated_next_probe_stall_fixture(script_dir: Path, tmp_path: Path
 def run_agent_runtime_autorecovery_fixture(script_dir: Path, tmp_path: Path) -> None:
     run_dir = tmp_path / "agent-runtime-autorecovery"
     run_dir.mkdir(parents=True, exist_ok=True)
+    project_root = run_dir / "project"
+    project_root.mkdir()
+    (project_root / "fixture.txt").write_text("runtime autorecovery fixture\n", encoding="utf-8")
     (run_dir / "requirement.md").write_text("- The runtime fixture page reaches the Ready state.\n", encoding="utf-8")
     state = {"visits": 0}
 
@@ -1823,6 +1832,7 @@ def run_agent_runtime_autorecovery_fixture(script_dir: Path, tmp_path: Path) -> 
             {
                 "schema_version": 1,
                 "adapter": "runtime_autorecovery_fixture",
+                "project_root": str(project_root),
                 "base_url": base_url,
                 "environment_boundary": {
                     "runtime_mode": "local",
@@ -1895,6 +1905,8 @@ def run_agent_runtime_autorecovery_fixture(script_dir: Path, tmp_path: Path) -> 
                 "--run-dir",
                 str(run_dir),
                 "--strict-runtime",
+                "--project-root",
+                str(project_root),
                 "--max-iterations",
                 "2",
             ],

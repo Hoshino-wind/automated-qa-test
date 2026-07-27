@@ -158,6 +158,10 @@ class AgentPolicyCliTests(unittest.TestCase):
             expected_context_sha256,
             "--state-sha256",
             STATE_SHA256,
+            "--model-id",
+            "planner-model@cli-test",
+            "--evidence-ref",
+            "requirement.md#R1",
             "--max-risk",
             max_risk,
             "--total-timeout",
@@ -241,6 +245,10 @@ class AgentPolicyCliTests(unittest.TestCase):
                         CONTEXT_SHA256,
                         "--state-sha256",
                         STATE_SHA256,
+                        "--model-id",
+                        "planner-model@cli-test",
+                        "--evidence-ref",
+                        "requirement.md#R1",
                         "--policy-version",
                         POLICY_VERSION,
                         "--now",
@@ -380,6 +388,69 @@ class AgentPolicyCliTests(unittest.TestCase):
                 self.assertIsNone(
                     result["decision"]["authorization"],
                 )
+
+    def test_policy_cli_rejects_input_aliases_and_unstable_files(
+        self,
+    ) -> None:
+        proposal_path = self.run_dir / "proposal-boundary.json"
+        write_json(
+            proposal_path,
+            proposal_payload(
+                action="goto",
+                arguments={"path": "/"},
+            ),
+        )
+        original = proposal_path.read_bytes()
+        base_command = [
+            "validate",
+            "--proposal",
+            str(proposal_path),
+            "--probe-id",
+            "P1",
+            "--context-sha256",
+            CONTEXT_SHA256,
+            "--state-sha256",
+            STATE_SHA256,
+            "--model-id",
+            "planner-model@cli-test",
+            "--evidence-ref",
+            "requirement.md#R1",
+            "--grant",
+            "isolated_test_environment",
+            "--max-risk",
+            "low",
+            "--now",
+            "100",
+        ]
+
+        alias_result = self.run_cli(
+            [*base_command, "--out", str(proposal_path)],
+        )
+
+        self.assertEqual(alias_result.returncode, 1)
+        self.assertEqual(proposal_path.read_bytes(), original)
+
+        symlink_path = self.run_dir / "proposal-symlink.json"
+        symlink_path.symlink_to(proposal_path)
+        symlink_output = self.run_dir / "symlink-result.json"
+        symlink_result = self.run_cli(
+            [
+                *base_command[:2],
+                str(symlink_path),
+                *base_command[3:],
+                "--out",
+                str(symlink_output),
+            ],
+        )
+
+        self.assertEqual(symlink_result.returncode, 1)
+        symlink_payload = json.loads(
+            symlink_output.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            symlink_payload["error"]["code"],
+            "proposal_symlink_rejected",
+        )
 
     def test_validate_plan_rejects_unknown_runner_action(self) -> None:
         plan_path = self.run_dir / "test-plan.json"

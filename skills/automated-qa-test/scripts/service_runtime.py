@@ -1,29 +1,164 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import json
 import os
 import re
 import shlex
 import signal
 import socket
+import stat
 import subprocess
+import sys
 import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from qa_common import atomic_write_json
+from qa_common import atomic_write_json, safe_output_path
 
 DESTRUCTIVE_COMMAND_RE = re.compile(
     r"\b(rm\s+-rf|mkfs|dd\s+if=|drop\s+table|truncate\s+table|delete\s+from|update\s+\w+\s+set|insert\s+into|gh\s+repo\s+delete|kubectl\s+delete|docker\s+(?:rm|rmi|system\s+prune|compose\s+down))\b",
     re.IGNORECASE,
 )
 SHELL_META_RE = re.compile(r"[;&|`<>]")
+SERVICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
 def now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+class ServiceRuntimeInterrupted(RuntimeError):
+    """Raised so termination requests unwind through emergency cleanup."""
+
+
+class ServiceLaunchGuard:
+    """Own newly spawned service groups until their runtime artifact is durable."""
+
+    def __init__(self, output_path: Path | None = None) -> None:
+        self.output_path = output_path
+        self.report: dict[str, Any] | None = None
+        self._managed: list[
+            tuple[subprocess.Popen[Any], int, str]
+        ] = []
+        self._armed = True
+
+    def attach(self, report: dict[str, Any]) -> None:
+        self.report = report
+        self.persist()
+
+    def track(
+        self,
+        proc: subprocess.Popen[Any],
+        *,
+        pgid: int,
+        service_id: str,
+    ) -> None:
+        self._managed.append((proc, pgid, service_id))
+
+    def persist(self) -> None:
+        if self.output_path is not None and self.report is not None:
+            write_json(self.output_path, self.report)
+
+    def disarm(self) -> None:
+        self._armed = False
+        self._managed.clear()
+
+    def terminate_all(self) -> dict[str, Any]:
+        """Best-effort emergency cleanup using handles created by this process."""
+
+        attempted: list[tuple[subprocess.Popen[Any], int, str]] = []
+        errors: list[dict[str, str]] = []
+        if not self._armed:
+            return {
+                "attempted_count": 0,
+                "remaining_count": 0,
+                "errors": [],
+            }
+        for proc, pgid, service_id in reversed(self._managed):
+            if proc.poll() is not None:
+                continue
+            attempted.append((proc, pgid, service_id))
+            try:
+                if pgid <= 1 or pgid == os.getpgrp():
+                    raise RuntimeError("unsafe managed process group")
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except Exception as error:
+                errors.append(
+                    {
+                        "service": service_id,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+        deadline = time.time() + 0.75
+        while (
+            any(proc.poll() is None for proc, _, _ in attempted)
+            and time.time() < deadline
+        ):
+            time.sleep(0.02)
+        for proc, pgid, service_id in attempted:
+            if proc.poll() is not None:
+                continue
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except Exception as error:
+                errors.append(
+                    {
+                        "service": service_id,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+        remaining = sum(
+            proc.poll() is None for proc, _, _ in attempted
+        )
+        return {
+            "attempted_count": len(attempted),
+            "remaining_count": remaining,
+            "errors": errors,
+        }
+
+
+@contextlib.contextmanager
+def blocked_termination_signals():
+    """Defer normal termination across the Popen-to-track critical section."""
+
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if pthread_sigmask is None:
+        yield
+        return
+    blocked = {signal.SIGTERM, signal.SIGINT}
+    previous = pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        yield
+    finally:
+        pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@contextlib.contextmanager
+def termination_cleanup_handlers():
+    """Translate normal termination signals into a catchable exception."""
+
+    previous: dict[int, Any] = {}
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        raise ServiceRuntimeInterrupted(
+            f"received termination signal {signum}"
+        )
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -148,6 +283,15 @@ def service_by_id(preflight: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def validate_start_item(item: dict[str, Any], service: dict[str, Any], project_root: Path) -> tuple[bool, list[str], Path | None, list[str]]:
     errors: list[str] = []
+    service_id = str(item.get("service") or "")
+    if not SERVICE_ID_RE.fullmatch(service_id):
+        errors.append(
+            "service id must use 1-128 safe filename characters"
+        )
+    if str(service.get("id") or "") != service_id:
+        errors.append(
+            "start plan references an unknown or mismatched service id"
+        )
     command = [str(part) for part in as_list(item.get("command")) if str(part)]
     cwd_raw = str(item.get("cwd") or service.get("path") or ".")
     cwd = (project_root / cwd_raw).resolve()
@@ -164,6 +308,69 @@ def validate_start_item(item: dict[str, Any], service: dict[str, Any], project_r
     return not errors, errors, cwd, command
 
 
+def open_service_log_handles(
+    run_dir: Path,
+    service_id: str,
+) -> tuple[Path, Path, Any, Any]:
+    """Open append-only logs through a pinned, non-symlink directory."""
+
+    if not SERVICE_ID_RE.fullmatch(service_id):
+        raise ValueError("unsafe service id for log files")
+    log_dir = run_dir / "service-logs"
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    observed = log_dir.lstat()
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(
+        observed.st_mode
+    ):
+        raise ValueError("service log directory must be a real directory")
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor = os.open(log_dir, directory_flags)
+    handles: list[Any] = []
+    names = (
+        f"{service_id}.stdout.log",
+        f"{service_id}.stderr.log",
+    )
+    try:
+        for name in names:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_APPEND
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                os.close(descriptor)
+                raise ValueError(
+                    "service log must be a single-link regular file"
+                )
+            handles.append(os.fdopen(descriptor, "ab"))
+    except Exception:
+        for handle in handles:
+            handle.close()
+        raise
+    finally:
+        os.close(directory_descriptor)
+    return (
+        log_dir / names[0],
+        log_dir / names[1],
+        handles[0],
+        handles[1],
+    )
+
+
 def wait_until_ready(service: dict[str, Any], proc: subprocess.Popen[Any], wait_timeout: float, poll_interval: float) -> dict[str, Any]:
     deadline = time.time() + wait_timeout
     last_check: dict[str, Any] = {}
@@ -178,7 +385,11 @@ def wait_until_ready(service: dict[str, Any], proc: subprocess.Popen[Any], wait_
     return {"ready": False, "check": last_check, "exit_code": proc.poll(), "reason": "timed out waiting for service readiness"}
 
 
-def start_services(args: argparse.Namespace) -> dict[str, Any]:
+def start_services(
+    args: argparse.Namespace,
+    *,
+    launch_guard: ServiceLaunchGuard | None = None,
+) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     preflight_path = Path(args.preflight).expanduser().resolve() if args.preflight else run_dir / "service-preflight.json"
     preflight, preflight_error = try_load_json(preflight_path)
@@ -189,7 +400,6 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
     services = service_by_id(preflight)
     selected = set(args.service or [])
     plan = [item for item in as_list(preflight.get("start_plan")) if not selected or item.get("service") in selected]
-    log_dir = run_dir / "service-logs"
     results: list[dict[str, Any]] = []
 
     report: dict[str, Any] = {
@@ -213,9 +423,16 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
             "shell_used": False,
             "default_is_dry_run": True,
             "services_started": False,
+            "launch_attempted": False,
+            "incremental_runtime_persistence": (
+                launch_guard is not None
+                and launch_guard.output_path is not None
+            ),
         },
         "input_artifact_errors": [],
     }
+    if launch_guard is not None:
+        launch_guard.attach(report)
 
     if not plan:
         report["summary"]["note"] = "No start candidates found in service-preflight.json."
@@ -238,35 +455,68 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
             entry["errors"] = validation_errors
             report["summary"]["failed_count"] += 1
             results.append(entry)
+            if launch_guard is not None:
+                launch_guard.persist()
             continue
         if entry["pre_start_readiness"].get("ready") is True and not args.force:
             entry["status"] = "already_ready"
             entry["post_start_readiness"] = entry["pre_start_readiness"]
             report["summary"]["ready_count"] += 1
             results.append(entry)
+            if launch_guard is not None:
+                launch_guard.persist()
             continue
         if not args.start:
             entry["status"] = "dry_run"
             entry["would_start"] = True
             report["summary"]["dry_run_count"] += 1
             results.append(entry)
+            if launch_guard is not None:
+                launch_guard.persist()
             continue
 
-        stdout_path = log_dir / f"{service_id}.stdout.log"
-        stderr_path = log_dir / f"{service_id}.stderr.log"
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        stdout_handle = stdout_path.open("ab")
-        stderr_handle = stderr_path.open("ab")
+        entry["status"] = "launch_intent"
+        entry["launch_sequence"] = len(results) + 1
+        report["safety"]["launch_attempted"] = True
+        results.append(entry)
+        if launch_guard is not None:
+            launch_guard.persist()
         try:
-            proc = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                stdin=subprocess.DEVNULL,
-                env=os.environ.copy(),
-                start_new_session=True,
+            (
+                stdout_path,
+                stderr_path,
+                stdout_handle,
+                stderr_handle,
+            ) = open_service_log_handles(run_dir, service_id)
+        except (OSError, ValueError) as exc:
+            entry["status"] = "failed_to_start"
+            entry["error"] = (
+                "service log boundary rejected launch: "
+                f"{type(exc).__name__}: {exc}"
             )
+            report["summary"]["failed_count"] += 1
+            if launch_guard is not None:
+                launch_guard.persist()
+            continue
+        try:
+            with blocked_termination_signals():
+                proc = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    stdin=subprocess.DEVNULL,
+                    env=os.environ.copy(),
+                    start_new_session=True,
+                )
+                if launch_guard is not None:
+                    launch_guard.track(
+                        proc,
+                        pgid=proc.pid,
+                        service_id=service_id,
+                    )
+        except ServiceRuntimeInterrupted:
+            raise
         except Exception as exc:
             stdout_handle.close()
             stderr_handle.close()
@@ -275,7 +525,8 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
             entry["stdout_log"] = str(stdout_path)
             entry["stderr_log"] = str(stderr_path)
             report["summary"]["failed_count"] += 1
-            results.append(entry)
+            if launch_guard is not None:
+                launch_guard.persist()
             continue
         finally:
             try:
@@ -295,12 +546,15 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
                 "started_by": "automated-qa-test/scripts/service_runtime.py",
             }
         )
-        entry["process_identity"] = process_identity(proc.pid)
         report["summary"]["started_count"] += 1
         report["safety"]["services_started"] = True
+        if launch_guard is not None:
+            launch_guard.persist()
         if args.no_wait:
             entry["status"] = "started_no_wait"
-            results.append(entry)
+            entry["process_identity"] = stable_process_identity(proc)
+            if launch_guard is not None:
+                launch_guard.persist()
             continue
         wait_result = wait_until_ready(service, proc, args.wait_timeout, args.poll_interval)
         entry["post_start_readiness"] = wait_result.get("check")
@@ -313,7 +567,9 @@ def start_services(args: argparse.Namespace) -> dict[str, Any]:
             entry["status"] = "unready"
             entry["error"] = wait_result.get("reason")
             report["summary"]["failed_count"] += 1
-        results.append(entry)
+        entry["process_identity"] = stable_process_identity(proc)
+        if launch_guard is not None:
+            launch_guard.persist()
 
     return report
 
@@ -353,6 +609,32 @@ def process_identity(pid: int) -> dict[str, Any]:
         "command_sha256": command_sha256(command) if command else None,
         "os_started_at": process_start_time(pid) or None,
     }
+
+
+def stable_process_identity(
+    proc: subprocess.Popen[Any],
+    *,
+    attempts: int = 20,
+    interval_seconds: float = 0.01,
+) -> dict[str, Any]:
+    """Capture identity after runtime startup has stopped rewriting process metadata."""
+
+    previous: dict[str, Any] | None = None
+    for _ in range(max(2, attempts)):
+        current = process_identity(proc.pid)
+        if (
+            current == previous
+            and current.get("command")
+            and current.get("command_sha256")
+            and current.get("os_started_at")
+            and current.get("pgid") is not None
+        ):
+            return current
+        previous = current
+        if proc.poll() is not None:
+            break
+        time.sleep(max(0.0, interval_seconds))
+    return previous or process_identity(proc.pid)
 
 
 def process_matches(pid: int, command: list[Any]) -> bool:
@@ -421,6 +703,7 @@ def stop_services(args: argparse.Namespace) -> dict[str, Any]:
         },
         "input_artifact_errors": [],
     }
+    pending: list[tuple[dict[str, Any], int, int]] = []
     for item in as_list(runtime.get("services")):
         service_id = str(item.get("service") or "")
         if selected and service_id not in selected:
@@ -456,36 +739,60 @@ def stop_services(args: argparse.Namespace) -> dict[str, Any]:
             report["summary"]["failed_count"] += 1
             stopped.append(entry)
             continue
+        entry["status"] = "terminating"
+        stopped.append(entry)
+        pending.append((entry, pid, pgid))
+
+    term_pending: list[tuple[dict[str, Any], int, int]] = []
+    for entry, pid, pgid in pending:
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             entry["status"] = "already_stopped"
             report["summary"]["skipped_count"] += 1
-            stopped.append(entry)
             continue
         except Exception as exc:
             entry["status"] = "failed"
             entry["error"] = f"{type(exc).__name__}: {exc}"
             report["summary"]["failed_count"] += 1
-            stopped.append(entry)
             continue
-        deadline = time.time() + args.stop_timeout
-        while time.time() <= deadline and pid_alive(pid):
-            time.sleep(0.2)
+        term_pending.append((entry, pid, pgid))
+
+    deadline = time.time() + args.stop_timeout
+    while (
+        any(pid_alive(pid) for _, pid, _ in term_pending)
+        and time.time() <= deadline
+    ):
+        time.sleep(0.05)
+
+    kill_pending: list[tuple[dict[str, Any], int, int]] = []
+    for entry, pid, pgid in term_pending:
         if pid_alive(pid):
             try:
                 os.killpg(pgid, signal.SIGKILL)
-                entry["status"] = "killed"
+                kill_pending.append((entry, pid, pgid))
             except Exception as exc:
                 entry["status"] = "failed"
                 entry["error"] = f"{type(exc).__name__}: {exc}"
                 report["summary"]["failed_count"] += 1
-                stopped.append(entry)
-                continue
         else:
             entry["status"] = "stopped"
-        report["summary"]["stopped_count"] += 1
-        stopped.append(entry)
+            report["summary"]["stopped_count"] += 1
+
+    kill_deadline = time.time() + min(1.0, args.stop_timeout)
+    while (
+        any(pid_alive(pid) for _, pid, _ in kill_pending)
+        and time.time() <= kill_deadline
+    ):
+        time.sleep(0.02)
+    for entry, pid, _ in kill_pending:
+        if pid_alive(pid):
+            entry["status"] = "failed"
+            entry["reason"] = "process remained alive after SIGKILL"
+            report["summary"]["failed_count"] += 1
+        else:
+            entry["status"] = "killed"
+            report["summary"]["stopped_count"] += 1
     return report
 
 
@@ -506,18 +813,126 @@ def main() -> int:
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).expanduser().resolve()
+    default_name = (
+        "service-runtime-stop.json"
+        if args.stop
+        else "service-runtime.json"
+    )
+    requested_out = (
+        Path(args.out).expanduser()
+        if args.out
+        else run_dir / default_name
+    )
     if args.stop:
-        report = stop_services(args)
-        default_name = "service-runtime-stop.json"
-        failed = bool(report.get("summary", {}).get("failed_count"))
+        protected = (
+            Path(args.runtime).expanduser()
+            if args.runtime
+            else run_dir / "service-runtime.json"
+        )
     else:
-        report = start_services(args)
-        default_name = "service-runtime.json"
-        failed = bool(args.start and report.get("summary", {}).get("failed_count"))
-    out_path = Path(args.out).expanduser().resolve() if args.out else run_dir / default_name
-    write_json(out_path, report)
+        protected = (
+            Path(args.preflight).expanduser()
+            if args.preflight
+            else run_dir / "service-preflight.json"
+        )
+    try:
+        out_path = safe_output_path(
+            requested_out,
+            protected_paths=(protected,),
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+    launch_guard = ServiceLaunchGuard(
+        out_path if args.start and not args.stop else None
+    )
+    try:
+        with termination_cleanup_handlers():
+            if args.stop:
+                report = stop_services(args)
+            else:
+                report = start_services(
+                    args,
+                    launch_guard=launch_guard,
+                )
+            write_json(out_path, report)
+            launch_guard.disarm()
+    except (Exception, KeyboardInterrupt) as error:
+        cleanup = launch_guard.terminate_all()
+        report = launch_guard.report or {
+            "schema_version": 1,
+            "generated_at": now(),
+            "mode": (
+                "stop"
+                if args.stop
+                else "start"
+                if args.start
+                else "dry_run"
+            ),
+            "run_dir": str(run_dir),
+            "services": [],
+            "summary": {
+                "planned_count": 0,
+                "started_count": 0,
+                "ready_count": 0,
+                "failed_count": 1,
+                "dry_run_count": 0,
+            },
+            "safety": {
+                "secret_values_read": False,
+                "shell_used": False,
+                "default_is_dry_run": True,
+                "services_started": False,
+                "launch_attempted": bool(args.start),
+                "incremental_runtime_persistence": bool(
+                    launch_guard.output_path
+                ),
+            },
+            "input_artifact_errors": [],
+        }
+        report.setdefault("runtime_errors", []).append(
+            {
+                "code": "service_runtime_interrupted",
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+        )
+        report.setdefault("safety", {})[
+            "emergency_cleanup"
+        ] = cleanup
+        summary = report.setdefault("summary", {})
+        failed_count = summary.get("failed_count")
+        summary["failed_count"] = max(
+            1,
+            failed_count
+            if isinstance(failed_count, int)
+            and not isinstance(failed_count, bool)
+            else 0,
+        )
+        try:
+            write_json(out_path, report)
+        except Exception as persist_error:
+            print(
+                "service runtime emergency report could not be persisted: "
+                f"{persist_error}",
+                file=sys.stderr,
+            )
+        print(
+            f"service runtime failed closed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        print(out_path)
+        return 1
+
+    failed = bool(
+        report.get("input_artifact_errors")
+        or (
+            (args.start or args.stop)
+            and report.get("summary", {}).get("failed_count")
+        )
+    )
     print(out_path)
-    return 1 if report.get("input_artifact_errors") or failed else 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

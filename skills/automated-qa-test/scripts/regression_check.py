@@ -1646,7 +1646,7 @@ def run_runtime_guard_phase(script_dir: Path, tmp_path: Path) -> None:
             ],
         },
     )
-    run_cmd(
+    runtime_cycle = subprocess.run(
         [
             sys.executable,
             str(script_dir / "run_qa_cycle.py"),
@@ -1657,11 +1657,26 @@ def run_runtime_guard_phase(script_dir: Path, tmp_path: Path) -> None:
             "--skip-report",
         ],
         cwd=runtime_issue_dir,
+        text=True,
+        capture_output=True,
+    )
+    assert_true(
+        runtime_cycle.returncode != 0,
+        "--skip-probe must remain a non-pass handoff even when runtime defects are generated.",
+    )
+    assert_true(
+        "Traceback" not in runtime_cycle.stderr,
+        "strict runtime skip-probe handoff must remain structured.",
     )
     runtime_summary = load_json(runtime_issue_dir / "qa-run-summary.json")
     runtime_defects = load_json(runtime_issue_dir / "defects.json")
     runtime_next = load_json(runtime_issue_dir / "next-probes.json")
     runtime_verdict = load_json(runtime_issue_dir / "qa-verdict.json")
+    runtime_reason_codes = {
+        item.get("code")
+        for item in runtime_verdict.get("reasons", [])
+        if isinstance(item, dict)
+    }
     runtime_actions = {rec.get("plan_step_hint", {}).get("action") for rec in runtime_next.get("recommendations", [])}
     runtime_api_recs = [
         rec
@@ -1676,7 +1691,12 @@ def run_runtime_guard_phase(script_dir: Path, tmp_path: Path) -> None:
     )
     assert_true(runtime_api_recs, "failed runtime HTTP responses should also recommend a same-endpoint API body-capture diagnostic.")
     assert_true(runtime_api_recs[0].get("required_inputs") == ["baseUrl"], "500 runtime response diagnostics should be safe when the failed endpoint is already captured.")
-    assert_true(runtime_verdict.get("can_claim_pass") is False and runtime_verdict.get("verdict") == "failed", "runtime findings must block pass claim.")
+    assert_true(
+        runtime_verdict.get("can_claim_pass") is False
+        and runtime_verdict.get("verdict") == "inconclusive"
+        and "current_probe_required" in runtime_reason_codes,
+        "runtime findings must remain available, while skip-probe stays a current-proof handoff.",
+    )
     run_cmd(
         [
             sys.executable,
@@ -1984,7 +2004,7 @@ def run_cycle_and_agent_phase(
         },
     )
 
-    run_cmd(
+    skipped_cycle = subprocess.run(
         [
             sys.executable,
             str(script_dir / "run_qa_cycle.py"),
@@ -1994,6 +2014,16 @@ def run_cycle_and_agent_phase(
             "--strict-runtime",
         ],
         cwd=run_dir,
+        text=True,
+        capture_output=True,
+    )
+    assert_true(
+        skipped_cycle.returncode != 0,
+        "skip-probe cycle must remain a non-pass handoff.",
+    )
+    assert_true(
+        "Traceback" not in skipped_cycle.stderr,
+        "skip-probe cycle handoff must remain structured.",
     )
     summary = load_json(run_dir / "qa-run-summary.json")
     verdict = load_json(run_dir / "qa-verdict.json")
@@ -2003,7 +2033,15 @@ def run_cycle_and_agent_phase(
     refreshed_oracle_model = load_json(run_dir / "oracle-model.json")
     refreshed_metrics = load_json(run_dir / "qa-metrics.json")
     refreshed_closeout = load_json(run_dir / "closeout-candidates.json")
-    assert_true(summary.get("status") == "blocked", "skip-probe cycle should produce blocked status for incomplete evidence.")
+    assert_true(
+        summary.get("status") == "inconclusive"
+        and any(
+            item.get("code") == "current_probe_required"
+            for item in verdict.get("reasons", [])
+            if isinstance(item, dict)
+        ),
+        "skip-probe cycle should produce a current-proof handoff.",
+    )
     assert_true(verdict.get("can_claim_pass") is False, "skip-probe verdict must not allow pass claim.")
     assert_true(next_probes.get("summary", {}).get("recommendation_count", 0) >= 1, "next-probes should recommend follow-up coverage.")
     assert_true(
@@ -2159,7 +2197,7 @@ def run_cycle_and_agent_phase(
             },
         },
     )
-    run_cmd(
+    loop_seed_cycle = subprocess.run(
         [
             sys.executable,
             str(script_dir / "run_qa_cycle.py"),
@@ -2169,8 +2207,14 @@ def run_cycle_and_agent_phase(
             "--strict-runtime",
         ],
         cwd=loop_run_dir,
+        text=True,
+        capture_output=True,
     )
-    run_cmd(
+    assert_true(
+        loop_seed_cycle.returncode != 0,
+        "agent-loop seed cycle must keep skip-probe handoff-only.",
+    )
+    agent_loop_proc = subprocess.run(
         [
             sys.executable,
             str(script_dir / "qa_agent_loop.py"),
@@ -2183,17 +2227,43 @@ def run_cycle_and_agent_phase(
             "2",
         ],
         cwd=loop_run_dir,
+        text=True,
+        capture_output=True,
+    )
+    assert_true(
+        agent_loop_proc.returncode != 0,
+        "planning-only agent loop must stop with a non-pass handoff.",
+    )
+    assert_true(
+        "Traceback" not in agent_loop_proc.stderr,
+        "planning-only agent loop handoff must remain structured.",
     )
     agent_summary = load_json(loop_run_dir / "qa-agent-summary.json")
     agent_final = agent_summary.get("final") or {}
     agent_application = agent_final.get("application_summary") or {}
     agent_preview = agent_final.get("preview_summary") or {}
     agent_next_action = agent_summary.get("next_action") or {}
-    assert_true(agent_preview.get("applied_count") == 1, "agent loop should preview one concrete WebSocket follow-up when live stream is authorized.")
-    assert_true(not agent_application or agent_application.get("applied_count", 0) == 0, "agent loop should not partially apply safe follow-ups while other actionable follow-ups still need input.")
+    assert_true(
+        not agent_preview or agent_preview.get("applied_count", 0) == 0,
+        "handoff-only agent loop must not preview follow-up execution before a current probe.",
+    )
+    assert_true(
+        not agent_application or agent_application.get("applied_count", 0) == 0,
+        "handoff-only agent loop must not apply follow-ups before a current probe.",
+    )
     assert_true(agent_final.get("can_claim_pass") is False, "agent loop must not claim pass after planning-only evidence.")
-    assert_true(agent_next_action.get("action") == "request_authorization_or_inputs", "mixed safe and blocked follow-ups should stop for an authorization/input handoff.")
-    assert_true(agent_next_action.get("blocked_followups", {}).get("actionable_skipped_count", 0) >= 1, "mixed follow-up handoff should expose the blocked follow-up count.")
+    assert_true(
+        agent_summary.get("stop_reason") == "cycle_stopped_with_verdict",
+        "handoff-only agent loop should stop on the structured current-proof verdict.",
+    )
+    assert_true(
+        agent_next_action.get("action") == "report_current_verdict",
+        "handoff-only agent loop should report the current-proof requirement before planning follow-up execution.",
+    )
+    assert_true(
+        "current_probe_required" in agent_next_action.get("reason_codes", []),
+        "handoff-only agent loop should preserve the current_probe_required reason.",
+    )
     assert_true(agent_next_action.get("automatable") is False, "stopped agent loop should not imply it can keep going automatically without a safe follow-up.")
     assert_true(all((item.get("next_action") or {}).get("action") for item in agent_summary.get("iterations", [])), "each agent-loop iteration should record its own next action.")
     summary = {

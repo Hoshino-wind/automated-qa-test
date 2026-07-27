@@ -12,7 +12,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from qa_common import atomic_write_json
+from qa_common import (
+    StableFileReadError,
+    atomic_write_json,
+    read_stable_regular_file,
+    safe_output_path,
+)
 from qa_core.agent import (
     AgentContractError,
     DeterministicPolicyEngine,
@@ -29,6 +34,7 @@ from qa_core.tools import (
 
 DEFAULT_HMAC_KEY_ENV = "QA_POLICY_HMAC_KEY"
 DEFAULT_POLICY_VERSION = "qa-default-policy@1"
+MAX_POLICY_INPUT_BYTES = 4 * 1024 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,6 +128,17 @@ def _add_proposal_binding_args(
         required=True,
     )
     parser.add_argument(
+        "--model-id",
+        required=True,
+        help="受信调用边界选择的精确模型/版本标识。",
+    )
+    parser.add_argument(
+        "--evidence-ref",
+        action="append",
+        required=True,
+        help="允许模型引用的已注入证据标识；可重复。",
+    )
+    parser.add_argument(
         "--policy-version",
         default=DEFAULT_POLICY_VERSION,
     )
@@ -135,7 +152,21 @@ def _add_proposal_binding_args(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    requested_output = getattr(args, "out", None)
+    args.out = None
     try:
+        if requested_output:
+            protected = [
+                Path(value)
+                for name in ("proposal", "authorization_file")
+                if (value := getattr(args, name, None))
+            ]
+            args.out = str(
+                safe_output_path(
+                    Path(requested_output),
+                    protected_paths=tuple(protected),
+                )
+            )
         if args.command == "registry":
             return _registry_command(args)
         if args.command == "validate":
@@ -180,6 +211,8 @@ def _validate_command(args: argparse.Namespace) -> int:
     proposal = PlanProposal.from_model_input(
         _read_object(Path(args.proposal), name="proposal"),
         registry=registry,
+        expected_model_id=args.model_id,
+        allowed_evidence_refs=tuple(args.evidence_ref),
     )
     clock = _clock(args.now)
     budget = RunBudget(
@@ -221,6 +254,8 @@ def _verify_command(args: argparse.Namespace) -> int:
     proposal = PlanProposal.from_model_input(
         _read_object(Path(args.proposal), name="proposal"),
         registry=registry,
+        expected_model_id=args.model_id,
+        allowed_evidence_refs=tuple(args.evidence_ref),
     )
     probe = proposal.find_probe(args.probe_id)
     authorization = ExecutionAuthorization.from_dict(
@@ -280,18 +315,64 @@ def _hmac_key_from_env(name: str) -> bytes:
 
 
 def _read_object(path: Path, *, name: str) -> dict[str, Any]:
-    if not path.is_file():
+    try:
+        raw = read_stable_regular_file(
+            path,
+            max_bytes=MAX_POLICY_INPUT_BYTES,
+        )
+    except FileNotFoundError as exc:
         raise PolicyContractError(
             f"{name}_missing",
             f"{name} 文件不存在：{path}",
-        )
-    value = json.loads(path.read_text(encoding="utf-8"))
+        ) from exc
+    except StableFileReadError as exc:
+        raise PolicyContractError(
+            f"{name}_{exc.code}",
+            str(exc),
+            path=f"$.{name}",
+        ) from exc
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=lambda pairs: _object_without_duplicates(
+            pairs,
+            name=name,
+        ),
+        parse_constant=lambda constant: _reject_nonfinite(
+            constant,
+            name=name,
+        ),
+    )
     if not isinstance(value, dict):
         raise PolicyContractError(
             f"{name}_not_object",
             f"{name} 文件根必须是 JSON object",
         )
     return value
+
+
+def _object_without_duplicates(
+    pairs: list[tuple[str, Any]],
+    *,
+    name: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise PolicyContractError(
+                f"{name}_duplicate_key",
+                f"{name} JSON 包含重复字段：{key}",
+                path=f"$.{name}.{key}",
+            )
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(value: str, *, name: str) -> None:
+    raise PolicyContractError(
+        f"{name}_nonfinite_number",
+        f"{name} JSON 不允许非有限数：{value}",
+        path=f"$.{name}",
+    )
 
 
 def _emit(payload: dict[str, Any], output: str | None) -> None:

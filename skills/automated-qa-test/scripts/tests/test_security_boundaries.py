@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -158,6 +159,426 @@ class SecurityBoundaryTests(unittest.TestCase):
         module = load_module("service_runtime_security_test", SCRIPT_DIR / "service_runtime.py")
         with mock.patch.object(module, "process_command", return_value="/usr/local/bin/node unrelated.js --port 9999"):
             self.assertFalse(module.process_matches(4242, ["node", "server.js", "--port", "3000"]))
+
+    def test_service_identity_is_sampled_until_runtime_metadata_stabilizes(self) -> None:
+        module = load_module("service_runtime_identity_test", SCRIPT_DIR / "service_runtime.py")
+        proc = mock.Mock(pid=4242)
+        proc.poll.return_value = None
+        launcher = {
+            "pid": 4242,
+            "pgid": 4242,
+            "command": "python3 -m http.server 3000",
+            "command_sha256": "launcher",
+            "os_started_at": "start",
+        }
+        runtime = {
+            "pid": 4242,
+            "pgid": 4242,
+            "command": "/usr/bin/python3 -m http.server 3000",
+            "command_sha256": "runtime",
+            "os_started_at": "start",
+        }
+        with (
+            mock.patch.object(module, "process_identity", side_effect=[launcher, runtime, runtime]),
+            mock.patch.object(module.time, "sleep"),
+        ):
+            self.assertEqual(module.stable_process_identity(proc), runtime)
+
+    def test_service_id_cannot_escape_the_log_directory(self) -> None:
+        module = load_module(
+            "service_runtime_service_id_test",
+            SCRIPT_DIR / "service_runtime.py",
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="qa-service-id-boundary-"
+        ) as raw:
+            root = Path(raw)
+            project_root = root / "project"
+            project_root.mkdir()
+            preflight = root / "service-preflight.json"
+            write_json(
+                preflight,
+                {
+                    "schema_version": 1,
+                    "project_root": str(project_root),
+                    "services": [
+                        {
+                            "id": "../../escaped",
+                            "path": ".",
+                            "default_url": "http://127.0.0.1:9",
+                        }
+                    ],
+                    "start_plan": [
+                        {
+                            "service": "../../escaped",
+                            "cwd": ".",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit(0)",
+                            ],
+                        }
+                    ],
+                },
+            )
+            args = argparse.Namespace(
+                run_dir=str(root),
+                preflight=str(preflight),
+                service=None,
+                start=True,
+                force=False,
+                no_wait=True,
+                wait_timeout=1.0,
+                poll_interval=0.1,
+            )
+
+            with mock.patch.object(module.subprocess, "Popen") as popen:
+                report = module.start_services(args)
+
+            self.assertEqual(report["summary"]["failed_count"], 1)
+            self.assertEqual(
+                report["services"][0]["status"],
+                "blocked_by_safety",
+            )
+            self.assertIn(
+                "service id",
+                " ".join(report["services"][0]["errors"]),
+            )
+            popen.assert_not_called()
+            self.assertFalse((root.parent / "escaped.stdout.log").exists())
+
+    def test_service_log_directory_symlink_is_rejected(self) -> None:
+        module = load_module(
+            "service_runtime_log_symlink_test",
+            SCRIPT_DIR / "service_runtime.py",
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="qa-service-log-boundary-"
+        ) as raw:
+            root = Path(raw)
+            project_root = root / "project"
+            project_root.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (root / "service-logs").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            preflight = root / "service-preflight.json"
+            write_json(
+                preflight,
+                {
+                    "schema_version": 1,
+                    "project_root": str(project_root),
+                    "services": [
+                        {
+                            "id": "fixture",
+                            "path": ".",
+                            "default_url": "http://127.0.0.1:9",
+                        }
+                    ],
+                    "start_plan": [
+                        {
+                            "service": "fixture",
+                            "cwd": ".",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit(0)",
+                            ],
+                        }
+                    ],
+                },
+            )
+            args = argparse.Namespace(
+                run_dir=str(root),
+                preflight=str(preflight),
+                service=None,
+                start=True,
+                force=False,
+                no_wait=True,
+                wait_timeout=1.0,
+                poll_interval=0.1,
+            )
+
+            with (
+                mock.patch.object(
+                    module,
+                    "readiness",
+                    return_value={"check": "tcp", "ready": False},
+                ),
+                mock.patch.object(module.subprocess, "Popen") as popen,
+            ):
+                report = module.start_services(args)
+
+            self.assertEqual(report["summary"]["failed_count"], 1)
+            self.assertEqual(
+                report["services"][0]["status"],
+                "failed_to_start",
+            )
+            self.assertIn(
+                "log boundary",
+                report["services"][0]["error"],
+            )
+            popen.assert_not_called()
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_service_launch_is_cleaned_if_runtime_persistence_fails(self) -> None:
+        module = load_module("service_runtime_persistence_test", SCRIPT_DIR / "service_runtime.py")
+        with tempfile.TemporaryDirectory(prefix="qa-service-persist-") as raw:
+            root = Path(raw)
+            project_root = root / "project"
+            project_root.mkdir()
+            preflight = root / "service-preflight.json"
+            output = root / "service-runtime.json"
+            write_json(
+                preflight,
+                {
+                    "schema_version": 1,
+                    "project_root": str(project_root),
+                    "services": [
+                        {
+                            "id": "fixture",
+                            "path": ".",
+                            "default_url": "http://127.0.0.1:9",
+                        }
+                    ],
+                    "start_plan": [
+                        {
+                            "service": "fixture",
+                            "cwd": ".",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "__import__('time').sleep(60)",
+                            ],
+                            "reason": "fault injection",
+                        }
+                    ],
+                },
+            )
+            fake_proc = mock.Mock(pid=54321)
+            fake_proc.poll.side_effect = [None, 0, 0, 0]
+            original_write = module.write_json
+            write_count = 0
+
+            def flaky_write(path: Path, value: dict) -> None:
+                nonlocal write_count
+                write_count += 1
+                if write_count == 3:
+                    raise OSError("injected persistence failure")
+                original_write(path, value)
+
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "service_runtime.py",
+                        "--run-dir",
+                        str(root),
+                        "--preflight",
+                        str(preflight),
+                        "--out",
+                        str(output),
+                        "--start",
+                        "--no-wait",
+                    ],
+                ),
+                mock.patch.object(
+                    module,
+                    "readiness",
+                    return_value={"check": "tcp", "ready": False},
+                ),
+                mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                    return_value=fake_proc,
+                ),
+                mock.patch.object(
+                    module.os,
+                    "getpgid",
+                    return_value=54321,
+                ),
+                mock.patch.object(module.os, "killpg") as killpg,
+                mock.patch.object(module, "write_json", side_effect=flaky_write),
+            ):
+                self.assertEqual(module.main(), 1)
+
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                killpg.call_args_list,
+                [mock.call(54321, module.signal.SIGTERM)],
+                report,
+            )
+            emergency = report["safety"]["emergency_cleanup"]
+            self.assertEqual(emergency["attempted_count"], 1)
+            self.assertEqual(emergency["remaining_count"], 0)
+            self.assertEqual(report["summary"]["failed_count"], 1)
+
+    def test_started_service_stage_requires_cleanup_without_artifact(self) -> None:
+        module = load_module("run_cycle_cleanup_test", SCRIPT_DIR / "run_qa_cycle.py")
+        with tempfile.TemporaryDirectory(prefix="qa-cleanup-missing-") as raw:
+            runtime = object.__new__(module.CycleRuntime)
+            runtime.service_start_attempted = True
+            runtime.service_runtime_path = Path(raw) / "missing-runtime.json"
+            runtime.current_artifacts = set()
+            self.assertTrue(runtime.cleanup_required())
+
+    def test_service_stop_signals_all_groups_before_shared_deadline(self) -> None:
+        module = load_module("service_runtime_parallel_stop_test", SCRIPT_DIR / "service_runtime.py")
+        with tempfile.TemporaryDirectory(prefix="qa-service-stop-") as raw:
+            root = Path(raw)
+            runtime_path = root / "service-runtime.json"
+
+            def identity(pid: int) -> dict:
+                command = f"/usr/bin/python3 service-{pid}.py"
+                return {
+                    "pid": pid,
+                    "pgid": pid,
+                    "command": command,
+                    "command_sha256": module.command_sha256(command),
+                    "os_started_at": "start",
+                }
+
+            write_json(
+                runtime_path,
+                {
+                    "schema_version": 1,
+                    "services": [
+                        {
+                            "service": "one",
+                            "pid": 101,
+                            "pgid": 101,
+                            "command": ["python3", "service-101.py"],
+                            "process_identity": identity(101),
+                        },
+                        {
+                            "service": "two",
+                            "pid": 102,
+                            "pgid": 102,
+                            "command": ["python3", "service-102.py"],
+                            "process_identity": identity(102),
+                        },
+                    ],
+                },
+            )
+            args = mock.Mock(
+                run_dir=str(root),
+                runtime=str(runtime_path),
+                service=[],
+                stop_timeout=0.1,
+            )
+            clock_value = 0.0
+
+            def clock() -> float:
+                nonlocal clock_value
+                clock_value += 0.1
+                return clock_value
+
+            with (
+                mock.patch.object(module, "process_identity", side_effect=identity),
+                mock.patch.object(module, "pid_alive", return_value=True),
+                mock.patch.object(module.os, "getpgrp", return_value=999),
+                mock.patch.object(module.os, "killpg") as killpg,
+                mock.patch.object(module.time, "time", side_effect=clock),
+                mock.patch.object(module.time, "sleep"),
+            ):
+                report = module.stop_services(args)
+
+            self.assertEqual(
+                killpg.call_args_list[:2],
+                [
+                    mock.call(101, module.signal.SIGTERM),
+                    mock.call(102, module.signal.SIGTERM),
+                ],
+            )
+            self.assertEqual(report["summary"]["failed_count"], 2)
+
+    def test_service_stop_cli_returns_nonzero_for_cleanup_failure(self) -> None:
+        module = load_module(
+            "service_runtime_stop_exit_test",
+            SCRIPT_DIR / "service_runtime.py",
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="qa-service-stop-exit-",
+        ) as raw:
+            root = Path(raw)
+            runtime_path = root / "service-runtime.json"
+            write_json(runtime_path, {"schema_version": 1, "services": []})
+            report = {
+                "schema_version": 1,
+                "mode": "stop",
+                "services": [
+                    {
+                        "service": "fixture",
+                        "status": "failed",
+                        "reason": "process remained alive after SIGKILL",
+                    },
+                ],
+                "summary": {
+                    "stopped_count": 0,
+                    "skipped_count": 0,
+                    "failed_count": 1,
+                },
+                "input_artifact_errors": [],
+            }
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "service_runtime.py",
+                        "--run-dir",
+                        str(root),
+                        "--runtime",
+                        str(runtime_path),
+                        "--stop",
+                    ],
+                ),
+                mock.patch.object(
+                    module,
+                    "stop_services",
+                    return_value=report,
+                ),
+            ):
+                self.assertEqual(module.main(), 1)
+            persisted = json.loads(
+                (root / "service-runtime-stop.json").read_text(
+                    encoding="utf-8",
+                ),
+            )
+            self.assertEqual(persisted["summary"]["failed_count"], 1)
+
+    def test_service_stop_cli_returns_nonzero_for_missing_runtime(self) -> None:
+        module = load_module(
+            "service_runtime_stop_missing_test",
+            SCRIPT_DIR / "service_runtime.py",
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="qa-service-stop-missing-",
+        ) as raw:
+            root = Path(raw)
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "service_runtime.py",
+                    "--run-dir",
+                    str(root),
+                    "--stop",
+                ],
+            ):
+                self.assertEqual(module.main(), 1)
+            persisted = json.loads(
+                (root / "service-runtime-stop.json").read_text(
+                    encoding="utf-8",
+                ),
+            )
+            self.assertEqual(
+                persisted["summary"]["input_artifact_error_count"],
+                1,
+            )
 
     def test_manual_evidence_cannot_pass_without_explicit_mode(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qa-manual-evidence-") as raw:

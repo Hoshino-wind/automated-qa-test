@@ -4,6 +4,7 @@ version = "0.2.0"
 description = "Evidence-bound automated QA/backtest skill helpers"
 requires-python = ">=3.12"
 license = { text = "MIT" }
+dependencies = ["cryptography>=47,<48"]
 
 [tool.ruff]
 target-version = "py312"

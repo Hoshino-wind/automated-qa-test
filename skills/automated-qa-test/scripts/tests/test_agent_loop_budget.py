@@ -80,7 +80,119 @@ def flag_value(command: list[str], flag: str) -> str:
     return command[command.index(flag) + 1]
 
 
+def flag_values(command: list[str], flag: str) -> list[str]:
+    return [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == flag
+    ]
+
+
 class AgentLoopBudgetTests(unittest.TestCase):
+    def test_cli_exposes_identity_knowledge_and_human_control_options(
+        self,
+    ) -> None:
+        module = load_agent_loop()
+        original_argv = sys.argv[:]
+        stdout = io.StringIO()
+        try:
+            sys.argv = ["qa_agent_loop.py", "--help"]
+            with (
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                module.main()
+        finally:
+            sys.argv = original_argv
+
+        self.assertEqual(caught.exception.code, 0)
+        help_text = stdout.getvalue()
+        for flag in (
+            "--candidate-identity-registration",
+            "--agent-bundle-dir",
+            "--candidate-policy",
+            "--candidate-memory-snapshot",
+            "--candidate-model-id",
+            "--human-authorization",
+            "--knowledge-store",
+            "--knowledge-trust-config",
+            "--knowledge-scope",
+            "--knowledge-journal-mode",
+            "--knowledge-checkpoint",
+            "--human-control-store",
+            "--human-control-trust-config",
+            "--human-control-journal-mode",
+            "--human-control-checkpoint",
+            "--human-request-ttl-seconds",
+            "--human-execution-epoch",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+    def test_cycle_and_resume_commands_preserve_identity_and_controls(
+        self,
+    ) -> None:
+        module = load_agent_loop()
+        args = cycle_args(
+            candidate_identity_registration="/proof/candidate.json",
+            agent_bundle_dir="/agent/bundle",
+            candidate_policy="/agent/policy.json",
+            candidate_memory_snapshot="/agent/memory.json",
+            candidate_model_id="model-proof-v1",
+            human_authorization="/proof/human-authorization.json",
+            knowledge_store="/knowledge/store",
+            knowledge_trust_config="/knowledge/trust.json",
+            knowledge_scope=["tenant:alpha", "repository:qa"],
+            knowledge_journal_mode="production",
+            knowledge_checkpoint="/knowledge/checkpoint.json",
+            human_control_store="/human/store",
+            human_control_trust_config="/human/trust.json",
+            human_control_journal_mode="production",
+            human_control_checkpoint="/human/checkpoint.json",
+            human_request_ttl_seconds=601.5,
+            human_execution_epoch=7,
+        )
+        commands = (
+            module.build_cycle_cmd(
+                args,
+                SCRIPT_DIR,
+                Path("/tmp/qa-agent-control-forward"),
+                apply_next=False,
+            ),
+            module.resume_loop_command(
+                args,
+                Path("/tmp/qa-agent-control-forward"),
+                max_iterations=4,
+            ),
+        )
+        expected = {
+            "--candidate-identity-registration": "/proof/candidate.json",
+            "--agent-bundle-dir": "/agent/bundle",
+            "--candidate-policy": "/agent/policy.json",
+            "--candidate-memory-snapshot": "/agent/memory.json",
+            "--candidate-model-id": "model-proof-v1",
+            "--human-authorization": "/proof/human-authorization.json",
+            "--knowledge-store": "/knowledge/store",
+            "--knowledge-trust-config": "/knowledge/trust.json",
+            "--knowledge-journal-mode": "production",
+            "--knowledge-checkpoint": "/knowledge/checkpoint.json",
+            "--human-control-store": "/human/store",
+            "--human-control-trust-config": "/human/trust.json",
+            "--human-control-journal-mode": "production",
+            "--human-control-checkpoint": "/human/checkpoint.json",
+            "--human-request-ttl-seconds": "601.5",
+            "--human-execution-epoch": "7",
+        }
+        for command in commands:
+            with self.subTest(command=command[1]):
+                for flag, value in expected.items():
+                    self.assertEqual(flag_value(command, flag), value)
+                self.assertEqual(
+                    flag_values(command, "--knowledge-scope"),
+                    ["tenant:alpha", "repository:qa"],
+                )
+
     def test_cli_rejects_unbounded_or_invalid_limits(self) -> None:
         module = load_agent_loop()
         invalid = (
