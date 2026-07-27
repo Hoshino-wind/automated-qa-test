@@ -1413,9 +1413,20 @@ function skippedStepRecord(scenario, rawStep, reason) {
 }
 
 function planNeedsBrowser(plan) {
+  const browserlessActions = new Set(["command", "api", "cleanupApi", "pollApi"]);
   for (const scenario of plan.scenarios || []) {
     for (const step of scenario.steps || []) {
-      if (step && step.action !== "command") return true;
+      if (step && !browserlessActions.has(step.action)) return true;
+    }
+  }
+  return false;
+}
+
+function planNeedsApiRequest(plan) {
+  const apiActions = new Set(["api", "cleanupApi", "pollApi"]);
+  for (const scenario of plan.scenarios || []) {
+    for (const step of scenario.steps || []) {
+      if (step && apiActions.has(step.action)) return true;
     }
   }
   return false;
@@ -1507,10 +1518,12 @@ async function main() {
   }
 
   const needsBrowser = planNeedsBrowser(plan);
+  const needsApiRequest = planNeedsApiRequest(plan);
   let chromium;
-  if (needsBrowser) {
+  let request;
+  if (needsBrowser || needsApiRequest) {
     try {
-      ({ chromium } = await loadPlaywright(path.resolve(planPath), plan));
+      ({ chromium, request } = await loadPlaywright(path.resolve(planPath), plan));
     } catch (error) {
       console.error("Could not import Playwright. Install project dependencies or run from a workspace that has playwright available.");
       console.error(error.message || String(error));
@@ -1596,6 +1609,12 @@ async function main() {
         });
       });
     }
+  } else if (needsApiRequest) {
+    const requestContextOptions = {};
+    if (plan.baseUrl) requestContextOptions.baseURL = plan.baseUrl;
+    if (plan.storageState) requestContextOptions.storageState = plan.storageState;
+    if (plan.extraHTTPHeaders) requestContextOptions.extraHTTPHeaders = plan.extraHTTPHeaders;
+    context = { request: await request.newContext(requestContextOptions) };
   }
 
   const ctx = {
@@ -1635,7 +1654,11 @@ async function main() {
     result.console.some((m) => m.type === "error")
     ? "attention"
     : "passed";
-  if (browser) await browser.close();
+  if (browser) {
+    await browser.close();
+  } else if (context?.request) {
+    await context.request.dispose();
+  }
 
   const resultPath = path.join(artifactDir, "results.json");
   await fs.writeFile(resultPath, JSON.stringify(redact(result), null, 2), "utf-8");

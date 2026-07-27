@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from qa_common import file_sha256
+
 from qa_core.state import EventLogError, RunEventType, RunState, RunStateStore
 
 from .session import RunSession

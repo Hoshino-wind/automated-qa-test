@@ -52,7 +52,7 @@ class RunSessionTests(unittest.TestCase):
         self.assertFalse((self.run_dir / LEASE_FILENAME).exists())
 
     def test_second_writer_is_rejected(self) -> None:
-        first = self.keep(
+        self.keep(
             RunSession.open(
                 self.run_dir,
                 owner_prefix=AGENT_OWNER_PREFIX,
@@ -91,7 +91,7 @@ class RunSessionTests(unittest.TestCase):
         self.assertIsNotNone(parent.lease.read())
 
     def test_non_parent_or_non_agent_lease_cannot_be_inherited(self) -> None:
-        unrelated = self.keep(
+        self.keep(
             RunSession.open(
                 self.run_dir,
                 owner_prefix=CYCLE_OWNER_PREFIX,

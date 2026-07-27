@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from qa_common import file_sha256
+
 from qa_core.contracts.artifacts import ARTIFACT_FILENAMES
 from qa_core.runtime.attempts import AttemptStore
 from qa_core.state import RunEventType, RunStateStore

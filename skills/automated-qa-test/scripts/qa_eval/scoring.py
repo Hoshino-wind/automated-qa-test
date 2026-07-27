@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 
 class EvaluationContractError(ValueError):
