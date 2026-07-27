@@ -1,8 +1,28 @@
-# 自动化 QA-Test
+# Automated QA Test
 
-[English](README.md) · [MIT 许可证](LICENSE)
+[![CI](https://github.com/Hoshino-wind/automated-qa-test/actions/workflows/ci.yml/badge.svg)](https://github.com/Hoshino-wind/automated-qa-test/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-这是一个面向 Codex 的、由需求驱动且证据绑定的 QA Skill。它把需求编译成 UI、API、WebSocket/SSE、持久化、日志或命令探针；所有 `Passed` 都必须绑定本次运行证据，最终由默认失败关闭的 `qa-verdict.json` 决定能否声称通过。
+[English](README.md)
+
+把一条产品需求转化为可执行探针、本次运行的真实证据，以及一份在证据不足时拒绝“通过”的严格结论。
+
+```text
+需求 → 测试矩阵 → 浏览器 / API / Stream / Command 探针
+     → 证据账本 → 独立证明验证 → Verdict + Report
+```
+
+## 15 秒了解项目
+
+AI 生成的测试报告可能看起来很完整，但底层行为并没有真正被观察。Automated QA Test 把每一个 `Passed` 都视为证据完整性问题：
+
+- 将需求编译成可追踪测试用例和可执行探针；
+- 把证据绑定到本次运行、原始需求、测试、步骤和内容哈希；
+- 允许受预算约束的 Agent Loop 继续调查，但模型输出永远不等于执行授权；
+- 旧文件、需求覆盖缺口、危险命令、未处理运行错误和并发写入都会默认失败关闭；
+- 由独立只读验证器闭合“状态 → Manifest → 不可变 Attempt → 当前输入”的证明图。
+
+它是一套面向 Codex 的需求驱动、证据绑定 QA Skill，而不是让模型给自己生成的报告打分。
 
 ## 运行要求
 

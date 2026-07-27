@@ -1,8 +1,28 @@
-# Automated QA-Test
+# Automated QA Test
 
-[中文文档](README.zh-CN.md) · [MIT License](LICENSE)
+[![CI](https://github.com/Hoshino-wind/automated-qa-test/actions/workflows/ci.yml/badge.svg)](https://github.com/Hoshino-wind/automated-qa-test/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A requirement-driven Codex skill for evidence-bound web, API, stream, persistence, and command QA. It compiles a requirement into executable probes, binds every `Passed` claim to current-run artifacts, and produces a fail-closed verdict and report.
+[简体中文](README.zh-CN.md)
+
+Turn one product requirement into executable probes, current-run evidence, and a verdict that refuses to pass when the proof is incomplete.
+
+```text
+requirement → test matrix → browser / API / stream / command probes
+            → evidence ledger → proof verifier → verdict + report
+```
+
+## The 15-second version
+
+AI-generated test reports can sound complete even when the underlying behavior was never observed. Automated QA Test treats every `Passed` claim as an evidence-integrity problem:
+
+- requirements are compiled into traceable test cases and executable probes;
+- evidence is bound to the current run, source requirement, test, step, and content hash;
+- a bounded Agent loop may investigate further, but model output is never treated as execution authorization;
+- stale files, missing coverage, unsafe commands, unresolved runtime errors, and competing writers fail closed;
+- an independent read-only verifier closes the state → manifest → immutable attempt → current-input proof graph.
+
+The result is a requirement-driven Codex skill for evidence-bound web, API, stream, persistence, and command QA—not a report generator that grades its own prose.
 
 ## Requirements
 
