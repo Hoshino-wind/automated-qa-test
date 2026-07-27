@@ -5,6 +5,8 @@
 
 [简体中文](README.zh-CN.md)
 
+![Automated QA Test — evidence-bound QA agent](docs/social-preview.png)
+
 Turn one product requirement into executable probes, current-run evidence, and a verdict that refuses to pass when the proof is incomplete.
 
 ```text

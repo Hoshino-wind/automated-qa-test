@@ -5,6 +5,8 @@
 
 [English](README.md)
 
+![Automated QA Test — 基于证据闭环的 QA Agent](docs/social-preview.png)
+
 把一条产品需求转化为可执行探针、本次运行的真实证据，以及一份在证据不足时拒绝“通过”的严格结论。
 
 ```text
